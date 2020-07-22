@@ -23,10 +23,7 @@ install_packages()
 {
     PKGLIST="python3-virtualenv python3-dev nginx"
 
-    # Update system package info
-    report_status "Running apt-get update..."
-    sudo apt-get update
-
+    
     # Install desired packages
     report_status "Installing packages..."
     sudo apt-get install --yes ${PKGLIST}
