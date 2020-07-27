@@ -60,7 +60,7 @@ WantedBy=multi-user.target
 Type=simple
 User=$MOONRAKER_USER
 RemainAfterExit=yes
-ExecStart=${PYTHONDIR}/bin/python ${HOME}/moonraker/moonraker.py 
+ExecStart=${PYTHONDIR}/bin/python ${SRCDIR}/moonraker/moonraker.py 
 Restart=always
 RestartSec=10
 EOF
