@@ -96,6 +96,12 @@ var api = {
     moonraker_log: {
         url: "/server/files/moonraker.log"
     },
+    printer_cfg: {
+        url: "/server/files/config/printer.cfg"
+    },
+    included_cfg_files: {
+        url: "/server/files/config/include/"
+    },
 
     // Machine APIs
     reboot: {
@@ -122,6 +128,8 @@ var paused = false;
 var klippy_ready = false;
 var api_type = 'http';
 var is_printing = false;
+var upload_location = "gcodes"
+var file_list_type = "gcodes";
 var json_rpc = new JsonRPC();
 
 function round_float (value) {
@@ -188,6 +196,19 @@ function update_filelist(filelist) {
     }
 }
 
+function update_configlist(cfglist) {
+    $("#filelist").empty();
+    // Add base printer.cfg
+    $("#filelist").append(
+        "<option value='printer.cfg'>printer.cfg</option>");
+    for (let file of cfglist) {
+        let fname = "include/" + file.filename;
+        $("#filelist").append(
+            "<option value='" + fname + "'>" +
+            fname + "</option>");
+    }
+}
+
 var last_progress = 0;
 function update_progress(loaded, total) {
     let progress = parseInt(loaded / total * 100);
@@ -215,11 +236,15 @@ function update_error(cmd, msg) {
 
 //***********Websocket-Klipper API Functions (JSON-RPC)************/
 function get_file_list() {
-    json_rpc.call_method(api.file_list.method)
+    let args = {root: file_list_type}
+    json_rpc.call_method_with_kwargs(api.file_list.method, args)
     .then((result) => {
         // result is an "ok" acknowledgment that the gcode has
         // been successfully processed
-        update_filelist(result);
+        if (file_list_type == "config")
+            update_configlist(result);
+        else
+            update_filelist(result);
     })
     .catch((error) => {
         update_error(api.file_list.method, error);
@@ -585,7 +610,10 @@ json_rpc.register_method("notify_klippy_state_changed", handle_klippy_state);
 function handle_file_list_changed(file_info) {
     // This event fires when a client has either added or removed
     // a gcode file.
-    update_filelist(file_info.filelist);
+    if (file_list_type == file_info.root)
+        get_file_list(file_info.root);
+    console.log("Filelist Changed:");
+    console.log(file_info);
 }
 json_rpc.register_method("notify_filelist_changed", handle_file_list_changed);
 
@@ -804,6 +832,12 @@ window.onload = () => {
             'disabled', (api_type == 'websocket' || disable_transfer));
         $('.reqws').prop('disabled', (api_type == 'http'));
         $('#apimethod').prop('hidden', (api_type == "websocket"));
+        $('#apiargs').prop('hidden', (api_type == "http"));
+    });
+
+    $('input[type=radio][name=file_type]').on('change', function() {
+        file_list_type = $(this).val();
+        get_file_list();
     });
 
     $('#cbxFileTransfer').on('change', function () {
@@ -845,7 +879,7 @@ window.onload = () => {
         // Send to a user defined endpoint and log the response
         if (api_type == 'http') {
             let sendtype = $("input[type=radio][name=api_cmd_type]:checked").val();
-            let url = $('#apiform [type=text]').val();
+            let url = $('#apirequest').val();
             let settings = {url: url}
             if (apikey != null)
                 settings.headers = {"X-Api-Key": apikey};
@@ -868,12 +902,14 @@ window.onload = () => {
                 $.ajax(settings);
             }
         } else {
-            let cmd = $('#apiform [type=text]').val().split(',', 2);
-            let method = cmd[0].trim();
-            if (cmd.length > 1) {
-                let args = cmd[1].trim();
-                if (args.startsWith("{")) {
-                    args = JSON.parse(args);
+            let method = $('#apirequest').val().trim();
+            let args = $('#apiargs').val();
+            if (args != "") {
+                try {
+                    args = JSON.parse("{" + args + "}");
+                } catch (error) {
+                    console.log("Unable to parse arguments");
+                    return
                 }
                 json_rpc.call_method_with_kwargs(method, args)
                 .then((result) => {
@@ -898,6 +934,7 @@ window.onload = () => {
     //  Hidden file element's click is forwarded to the button
     $('#btnupload').click(() => {
         if (api_type == "http") {
+            upload_location = file_list_type;
             $('#upload-file').click();
         } else {
             console.log("File Upload not supported over websocket")
@@ -919,6 +956,13 @@ window.onload = () => {
             if (api_type == 'http') {
                 let fdata = new FormData();
                 fdata.append("file", file);
+                if (upload_location.startsWith("config")) {
+                    fdata.append("root", "config");
+                    if (upload_location == "config_main")
+                        fdata.append("primary_config", "true");
+                } else {
+                    fdata.append("root", upload_location);
+                }
                 let settings = {
                     url: api.upload.url,
                     data: fdata,
@@ -957,8 +1001,20 @@ window.onload = () => {
         let filename = $("#filelist").val();
         if (filename) {
             if (api_type == 'http') {
-                // TODO: Must use oneshot token to download if API Key authorization is required
-                let dl_url = "http://" + location.host + api.gcode_files.url + filename;
+                let url = api.gcode_files.url + filename;
+                if (file_list_type == "config") {
+                    url = api.included_cfg_files.url + filename;
+                    if (filename.startsWith("include/")) {
+                        url = api.included_cfg_files.url + filename.slice(8);
+                    } else if (filename == "printer.cfg") {
+                        url = api.printer_cfg.url;
+                    }
+                    else {
+                        console.log("Cannot download file: " + filename);
+                        return false;
+                    }
+                }
+                let dl_url = "http://" + location.host + url;
                 if (apikey != null) {
                     let settings = {
                         url: api.oneshot_token.url,
@@ -985,8 +1041,18 @@ window.onload = () => {
         let filename = $("#filelist").val();
         if (filename) {
             if (api_type == 'http') {
+                let url = api.gcode_files.url + filename;
+                if (file_list_type == "config") {
+                    url = api.included_cfg_files.url + filename;
+                    if (filename.startsWith("include/")) {
+                        url = api.included_cfg_files.url + filename.slice(8);
+                    } else {
+                        console.log("Cannot Delete printer.cfg");
+                        return false;
+                    }
+                }
                 let settings = {
-                    url: api.gcode_files.url + filename,
+                    url: url,
                     method: 'DELETE',
                     success: (resp, status) => {
                         console.log(resp);
@@ -1073,6 +1139,53 @@ window.onload = () => {
             } else {
                 get_metadata(filename);
             }
+        }
+    });
+
+    // Refresh File List
+    $("#btngetfiles").click(() =>{
+        if (api_type == 'http') {
+            let url = api.file_list.url + "?root=" + file_list_type;
+            let settings = {url: url};
+            if (apikey != null)
+                settings.headers = {"X-Api-Key": apikey};
+            $.get(settings, (resp, status) => {
+                    console.log(resp);
+                    return false;
+            });
+        } else {
+            get_file_list();
+        }
+    });
+
+    $('#btnwritecfg').click(() => {
+        if (api_type == "http") {
+            upload_location = "config_main";
+            $('#upload-file').click();
+        } else {
+            console.log("File Upload not supported over websocket")
+        }
+    });
+
+    $('#btngetcfg').click(() => {
+        if (api_type == 'http') {
+            let dl_url = "http://" + location.host + api.printer_cfg.url;
+            if (apikey != null) {
+                let settings = {
+                    url: api.oneshot_token.url,
+                    headers: {"X-Api-Key": apikey}
+                };
+                $.get(settings, (resp, status) => {
+                    let token = resp.result;
+                    dl_url += "?token=" + token;
+                    do_download(dl_url);
+                    return false;
+                });
+            } else {
+                do_download(dl_url);
+            }
+        } else {
+            console.log("Get Log not supported over websocket")
         }
     });
 

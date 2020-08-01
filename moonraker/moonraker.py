@@ -218,8 +218,11 @@ class Server:
         await self._request_endpoints()
         if not self.server_configured:
             await self._request_config()
-        await self._request_ready()
-        if self.is_klippy_ready:
+        if not self.is_klippy_ready:
+            await self._request_ready()
+        if self.is_klippy_ready and self.server_configured:
+            # Make sure we have all registered endpoints
+            await self._request_endpoints()
             self.init_cb.stop()
 
     async def _request_endpoints(self):
@@ -241,15 +244,27 @@ class Server:
         if not isinstance(result, ServerError):
             self._load_config(result)
             self.server_configured = True
+        else:
+            logging.info(
+                "Error receiving configuration.  This indicates a "
+                "potential configuration issue in printer.cfg.  Please check "
+                "klippy.log for more information")
 
     async def _request_ready(self):
-        request = self.make_request(
-            "moonraker/check_ready", "GET", {})
+        request = self.make_request("info", "GET", {})
         result = await request.wait()
         if not isinstance(result, ServerError):
             is_ready = result.get("is_ready", False)
             if is_ready:
-                self._set_klippy_ready(result.get('sensors', {}))
+                self._set_klippy_ready()
+            else:
+                msg = result.get("message", "Klippy Not Ready")
+                logging.info(msg)
+        else:
+            logging.info(
+                "Klippy Info request error.  This indicates a that Klippy "
+                "may have experienced an error during startup.  Please check "
+                "klippy.log for more information")
 
     def _load_config(self, config):
         self.request_timeout = config.get(
@@ -293,10 +308,9 @@ class Server:
         else:
             logging.info("No request matching response: " + str(response))
 
-    def _set_klippy_ready(self, sensors):
+    def _set_klippy_ready(self):
         logging.info("Klippy ready")
         self.is_klippy_ready = True
-        self.send_event("server:refresh_temp_sensors", sensors)
         self.send_event("server:klippy_state_changed", "ready")
 
     def _set_klippy_shutdown(self):
@@ -326,16 +340,6 @@ class Server:
             base_request.notify(
                 ServerError("Klippy Host not connected", 503))
         return base_request
-
-    def notify_filelist_changed(self, filename, action):
-        file_manager = self.lookup_plugin('file_manager')
-        try:
-            filelist = file_manager.get_file_list(format_list=True)
-        except ServerError:
-            filelist = []
-        result = {'filename': filename, 'action': action,
-                  'filelist': filelist}
-        self.send_event("server:filelist_changed", result)
 
     async def _kill_server(self):
         # XXX - Currently this function is not used.
