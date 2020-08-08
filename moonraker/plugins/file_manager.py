@@ -13,6 +13,7 @@ from tornado.ioloop import IOLoop
 from tornado.locks import Lock
 
 VALID_GCODE_EXTS = ['gcode', 'g', 'gco']
+FULL_ACCESS_ROOTS = ["gcodes", "config"]
 METADATA_SCRIPT = os.path.join(
     os.path.dirname(__file__), "../../scripts/extract_metadata.py")
 
@@ -56,22 +57,14 @@ class FileManager:
                 self._update_file_list()
             except Exception:
                 logging.exception("Unable to initialize gcode file list")
-        # Main configuration file
-        main_cfg = config.get('printer_config_main', None)
-        if main_cfg is not None:
-            main_cfg = os.path.normpath(os.path.expanduser(main_cfg))
-            if main_cfg != self.file_paths.get("printer.cfg", ""):
-                self.file_paths['printer.cfg'] = main_cfg
+        # Configuration files in the optional config path
+        cfg_path = config.get('printer_config_path', None)
+        if cfg_path is not None:
+            cfg_path = os.path.normpath(os.path.expanduser(cfg_path))
+            if cfg_path != self.file_paths.get('config', ""):
+                self.file_paths['config'] = cfg_path
                 self.server.register_static_file_handler(
-                    '/server/files/config/printer.cfg', main_cfg)
-        # "Included" configuration files
-        included_cfg = config.get('printer_config_path', None)
-        if included_cfg is not None:
-            included_cfg = os.path.normpath(os.path.expanduser(included_cfg))
-            if included_cfg != self.file_paths.get('config', ""):
-                self.file_paths['config'] = included_cfg
-                self.server.register_static_file_handler(
-                    "/server/files/config/include/", included_cfg,
+                    "/server/files/config/", cfg_path,
                     can_delete=True)
             try:
                 self._update_file_list(base='config')
@@ -84,7 +77,7 @@ class FileManager:
             if example_cfg_path != self.file_paths.get("config_examples", ""):
                 self.file_paths['config_examples'] = example_cfg_path
                 self.server.register_static_file_handler(
-                    "/server/files/config/examples/", example_cfg_path)
+                    "/server/files/config_examples/", example_cfg_path)
             try:
                 self._update_file_list(base='config_examples')
             except Exception:
@@ -114,14 +107,14 @@ class FileManager:
         if method == 'GET':
             # Get list of files and subdirectories for this target
             return self._list_directory(dir_path)
-        elif method == 'POST' and base in ["gcodes", "config"]:
+        elif method == 'POST' and base in FULL_ACCESS_ROOTS:
             # Create a new directory
             try:
                 os.mkdir(dir_path)
             except Exception as e:
                 raise self.server.error(str(e))
             self.notify_filelist_changed(url_path, "add_directory", base)
-        elif method == 'DELETE' and base in ["gcodes", "config"]:
+        elif method == 'DELETE' and base in FULL_ACCESS_ROOTS:
             # Remove a directory
             if directory.strip("/") == base:
                 raise self.server.error(
@@ -191,10 +184,9 @@ class FileManager:
                 "File move/copy request missing destination")
         source_base, src_url_path, source_path = self._convert_path(source)
         dest_base, dst_url_path, dest_path = self._convert_path(destination)
-        if source_base != dest_base or source_base not in ["gcodes", "config"]:
+        if dest_base not in FULL_ACCESS_ROOTS:
             raise self.server.error(
-                "Unsupported root directory: source=%s base=%s" %
-                (source_base, dest_base))
+                "Destination path is read-only: %s" % (dest_base))
         if not os.path.exists(source_path):
             raise self.server.error("File %s does not exist" % (source_path))
         # make sure the destination is not in use
@@ -202,6 +194,10 @@ class FileManager:
             await self._handle_operation_check(dest_path)
         action = ""
         if path == "/server/files/move":
+            if source_base not in FULL_ACCESS_ROOTS:
+                raise self.server.error(
+                    "Source path is read-only, cannot move: %s"
+                    % (source_base))
             # if moving the file, make sure the source is not in use
             await self._handle_operation_check(source_path)
             try:
@@ -219,7 +215,8 @@ class FileManager:
                 raise self.server.error(str(e))
             action = "file_copy"
         self.notify_filelist_changed(
-            dst_url_path, action, dest_base, {'prev_file': src_url_path})
+            dst_url_path, action, dest_base,
+            {'prev_file': src_url_path, 'prev_root': source_base})
         return "ok"
 
     def _list_directory(self, path):
@@ -317,17 +314,17 @@ class FileManager:
         root = self._get_argument(request, 'root', "gcodes")
         if root == "gcodes":
             result = await self._do_gcode_upload(request)
-        elif root == "config":
-            result = self._do_config_upload(request)
+        elif root in FULL_ACCESS_ROOTS:
+            result = self._do_standard_upload(request, root)
         else:
-            raise self.server.error(400, "Unknown root path")
+            raise self.server.error("Invalid root request: %s" % (root))
         return result
 
     async def _do_gcode_upload(self, request):
         start_print = print_ongoing = False
         base_path = self.file_paths.get("gcodes", "")
         if not base_path:
-            raise self.server.error(400, "Gcodes root not available")
+            raise self.server.error("Gcodes root not available")
         start_print = self._get_argument(request, 'print', "false") == "true"
         upload = self._get_upload_info(request, base_path)
         # Verify that the operation can be done if attempting to upload a gcode
@@ -337,7 +334,7 @@ class FileManager:
         except self.server.error as e:
             if e.status_code == 403:
                 raise self.server.error(
-                    403, "File is loaded, upload not permitted")
+                    "File is loaded, upload not permitted", 403)
             else:
                 # Couldn't reach Klippy, so it should be safe
                 # to permit the upload but not start
@@ -357,19 +354,13 @@ class FileManager:
         self.notify_filelist_changed(upload['filename'], 'added', "gcodes")
         return {'result': upload['filename'], 'print_started': start_print}
 
-    def _do_config_upload(self, request):
-        req_arg = self._get_argument(request, 'primary_config', "false")
-        is_main_config = req_arg.lower() == "true"
-        cfg_base = "printer.cfg" if is_main_config else "config"
-        cfg_path = self.file_paths.get(cfg_base, None)
-        if cfg_path is None:
-            raise self.server.error(
-                "Printer configuration location on disk not set")
-        upload = self._get_upload_info(request, cfg_path)
+    def _do_standard_upload(self, request, root):
+        path = self.file_paths.get(root, None)
+        if path is None:
+            raise self.server.error("Unknown root path: %s" % (root))
+        upload = self._get_upload_info(request, path)
         self._write_file(upload)
-        if cfg_base == "config":
-            self.notify_filelist_changed(
-                upload['filename'], 'added', "config")
+        self.notify_filelist_changed(upload['filename'], 'added', root)
         return {'result': upload['filename']}
 
     def _get_argument(self, request, name, default=None):
@@ -384,11 +375,11 @@ class FileManager:
         # fetch the upload from the request
         if len(request.files) != 1:
             raise self.server.error(
-                400, "Bad Request, can only process a single file upload")
+                "Bad Request, can only process a single file upload")
         f_list = list(request.files.values())[0]
         if len(f_list) != 1:
             raise self.server.error(
-                400, "Bad Request, can only process a single file upload")
+                "Bad Request, can only process a single file upload")
         upload = f_list[0]
         if os.path.isfile(base_path):
             filename = os.path.basename(base_path)
@@ -416,7 +407,7 @@ class FileManager:
             with open(upload['full_path'], 'wb') as fh:
                 fh.write(upload['body'])
         except Exception:
-            raise self.server.error(500, "Unable to save file")
+            raise self.server.error("Unable to save file", 500)
 
     def get_file_list(self, format_list=False, base='gcodes'):
         try:
