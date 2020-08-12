@@ -7,8 +7,8 @@
 GCODE_ENDPOINT = "gcode/script"
 
 class GCodeAPIs:
-    def __init__(self, server):
-        self.server = server
+    def __init__(self, config):
+        self.server = config.get_server()
 
         # Register GCode Endpoints
         self.server.register_endpoint(
@@ -52,16 +52,26 @@ class GCodeAPIs:
         filename = args.get('filename')
         # XXX - validate that file is on disk
 
-        if filename[0] != '/':
-            filename = '/' + filename
-        script = "M23 " + filename + "\nM24"
+        if filename[0] == '/':
+            filename = filename[1:]
+        script = "SDCARD_PRINT_FILE FILENAME=" + filename
         return await self._send_gcode(script)
 
     async def gcode_restart(self, path, method, args):
-        return await self._send_gcode("RESTART")
+        return await self._do_restart("RESTART")
 
     async def gcode_firmware_restart(self, path, method, args):
-        return await self._send_gcode("FIRMWARE_RESTART")
+        return await self._do_restart("FIRMWARE_RESTART")
 
-def load_plugin(server):
-    return GCodeAPIs(server)
+    async def _do_restart(self, gc):
+        try:
+            result = await self._send_gcode(gc)
+        except self.server.error as e:
+            if str(e) == "Klippy Disconnected":
+                result = "ok"
+            else:
+                raise
+        return result
+
+def load_plugin(config):
+    return GCodeAPIs(config)

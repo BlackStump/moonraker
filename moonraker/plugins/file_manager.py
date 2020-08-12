@@ -18,12 +18,15 @@ METADATA_SCRIPT = os.path.join(
     os.path.dirname(__file__), "../../scripts/extract_metadata.py")
 
 class FileManager:
-    def __init__(self, server):
-        self.server = server
+    def __init__(self, config):
+        self.server = config.get_server()
         self.file_paths = {}
         self.file_lists = {}
         self.gcode_metadata = {}
         self.metadata_lock = Lock()
+        self.mutable_path_args = {}
+
+        # Register file management endpoints
         self.server.register_endpoint(
             "/server/files/list", "file_list", ['GET'],
             self._handle_filelist_request)
@@ -43,49 +46,71 @@ class FileManager:
         self.server.register_upload_handler("/server/files/upload")
         self.server.register_upload_handler("/api/files/local")
 
-    def load_config(self, config):
-        # Gcode Files
-        sd = config.get('sd_path', None)
-        if sd is not None:
-            sd = os.path.normpath(os.path.expanduser(sd))
-            if sd != self.file_paths.get('gcodes', ""):
-                self.file_paths['gcodes'] = sd
-                self.server.register_static_file_handler(
-                    '/server/files/gcodes/', sd, can_delete=True,
-                    op_check_cb=self._handle_operation_check)
-            try:
-                self._update_file_list()
-            except Exception:
-                logging.exception("Unable to initialize gcode file list")
-        # Configuration files in the optional config path
-        cfg_path = config.get('printer_config_path', None)
-        if cfg_path is not None:
-            cfg_path = os.path.normpath(os.path.expanduser(cfg_path))
-            if cfg_path != self.file_paths.get('config', ""):
-                self.file_paths['config'] = cfg_path
-                self.server.register_static_file_handler(
-                    "/server/files/config/", cfg_path,
-                    can_delete=True)
-            try:
-                self._update_file_list(base='config')
-            except Exception:
-                logging.exception("Unable to initialize config file list")
+        # Register Klippy Configuration Path
+        config_path = config.get('config_path', None)
+        if config_path is not None:
+            ret = self._register_directory(
+                'config', config_path, can_delete=True)
+            if not ret:
+                raise config.error(
+                    "Option 'config_path' is not a valid directory")
+
+    def update_mutable_paths(self, paths):
+        # Update paths from Klippy.  The sd_path can potentially change
+        # location on restart.
+        if paths == self.mutable_path_args:
+            # No change in mutable paths
+            return
+        self.mutable_path_args = dict(paths)
+        str_paths = "\n".join([f"{k}: {v}" for k, v in paths.items()])
+        logging.debug(f"\nUpdating Mutable Paths:\n{str_paths}")
+
+        # Register directories
+        sd = paths.pop('sd_path', None)
+        self._register_directory("gcodes", sd, can_delete=True)
         # Register path for example configs
-        klipper_path = config.get('klipper_path', None)
+        klipper_path = paths.pop('klipper_path', None)
         if klipper_path is not None:
             example_cfg_path = os.path.join(klipper_path, "config")
-            if example_cfg_path != self.file_paths.get("config_examples", ""):
-                self.file_paths['config_examples'] = example_cfg_path
-                self.server.register_static_file_handler(
-                    "/server/files/config_examples/", example_cfg_path)
+            self._register_directory("config_examples", example_cfg_path)
+        paths.pop('klippy_env', None)
+        paths.pop('printer.cfg', None)
+
+        # register remaining static files
+        for pattern, path in paths.items():
+            if path is not None:
+                path = os.path.normpath(os.path.expanduser(path))
+                self.server.register_static_file_handler(pattern, path)
+
+    def _register_directory(self, base, path, can_delete=False):
+        op_check_cb = None
+        if base == 'gcodes':
+            op_check_cb = self._handle_operation_check
+        if path is None:
+            return False
+        home = os.path.expanduser('~')
+        path = os.path.normpath(os.path.expanduser(path))
+        if not os.path.isdir(path) or not path.startswith(home) or \
+                path == home:
+            logging.info(
+                f"Supplied path ({path}) for ({base}) not valid")
+            return False
+        if path != self.file_paths.get(base, ""):
+            self.file_paths[base] = path
+            self.server.register_static_file_handler(
+                base, path, can_delete=can_delete, op_check_cb=op_check_cb)
             try:
-                self._update_file_list(base='config_examples')
+                self._update_file_list(base=base)
             except Exception:
                 logging.exception(
-                    "Unable to initialize config_examples file list")
+                    f"Unable to initialize file list: <{base}>")
+        return True
 
     def get_sd_directory(self):
         return self.file_paths.get('gcodes', "")
+
+    def get_mutable_path_args(self):
+        return dict(self.mutable_path_args)
 
     async def _handle_filelist_request(self, path, method, args):
         root = args.get('root', "gcodes")
@@ -96,7 +121,7 @@ class FileManager:
         metadata = self.gcode_metadata.get(requested_file)
         if metadata is None:
             raise self.server.error(
-                "Metadata not available for <%s>" % (requested_file), 404)
+                f"Metadata not available for <{requested_file}>", 404)
         metadata['filename'] = requested_file
         return metadata
 
@@ -113,7 +138,7 @@ class FileManager:
                 os.mkdir(dir_path)
             except Exception as e:
                 raise self.server.error(str(e))
-            self.notify_filelist_changed(url_path, "add_directory", base)
+            self.notify_filelist_changed("create_dir", url_path, base)
         elif method == 'DELETE' and base in FULL_ACCESS_ROOTS:
             # Remove a directory
             if directory.strip("/") == base:
@@ -121,7 +146,7 @@ class FileManager:
                     "Cannot delete root directory")
             if not os.path.isdir(dir_path):
                 raise self.server.error(
-                    "Directory does not exist (%s)" % (directory))
+                    f"Directory does not exist ({directory})")
             force = args.get('force', False)
             if isinstance(force, str):
                 force = force.lower() == "true"
@@ -135,7 +160,7 @@ class FileManager:
                     os.rmdir(dir_path)
                 except Exception as e:
                     raise self.server.error(str(e))
-            self.notify_filelist_changed(url_path, "delete_directory", base)
+            self.notify_filelist_changed("delete_dir", url_path, base)
         else:
             raise self.server.error("Operation Not Supported", 405)
         return "ok"
@@ -143,30 +168,32 @@ class FileManager:
     async def _handle_operation_check(self, requested_path):
         # Get virtual_sdcard status
         request = self.server.make_request(
-            "objects/status", 'GET', {'virtual_sdcard': []})
+            "objects/status", 'GET', {'print_stats': []})
         result = await request.wait()
         if isinstance(result, self.server.error):
             raise result
-        vsd = result.get('virtual_sdcard', {})
-        loaded_file = vsd.get('filename', "")
+        pstats = result.get('print_stats', {})
+        loaded_file = pstats.get('filename', "")
+        state = pstats.get('state', "")
         gc_path = self.file_paths.get('gcodes', "")
         full_path = os.path.join(gc_path, loaded_file)
-        if os.path.isdir(requested_path):
-            # Check to see of the loaded file is in the reques
-            if full_path.startswith(requested_path):
+        if loaded_file and state != "complete":
+            if os.path.isdir(requested_path):
+                # Check to see of the loaded file is in the request
+                if full_path.startswith(requested_path):
+                    raise self.server.error("File currently in use", 403)
+            elif full_path == requested_path:
                 raise self.server.error("File currently in use", 403)
-        elif full_path == requested_path:
-            raise self.server.error("File currently in use", 403)
-        ongoing = vsd.get('total_duration', 0.) > 0.
+        ongoing = state in ["printing", "paused"]
         return ongoing
 
     def _convert_path(self, url_path):
         parts = url_path.strip("/").split("/")
         if not parts:
-            raise self.server.error("Invalid path: " % (url_path))
+            raise self.server.error(f"Invalid path: {url_path}")
         base = parts[0]
         if base not in self.file_paths:
-            raise self.server.error("Invalid base path (%s)" % (base))
+            raise self.server.error(f"Invalid base path ({base})")
         root_path = local_path = self.file_paths[base]
         url_path = ""
         if len(parts) > 1:
@@ -186,59 +213,62 @@ class FileManager:
         dest_base, dst_url_path, dest_path = self._convert_path(destination)
         if dest_base not in FULL_ACCESS_ROOTS:
             raise self.server.error(
-                "Destination path is read-only: %s" % (dest_base))
+                f"Destination path is read-only: {dest_base}")
         if not os.path.exists(source_path):
-            raise self.server.error("File %s does not exist" % (source_path))
+            raise self.server.error(f"File {source_path} does not exist")
         # make sure the destination is not in use
         if os.path.exists(dest_path):
             await self._handle_operation_check(dest_path)
-        action = ""
+        action = op_result = ""
         if path == "/server/files/move":
             if source_base not in FULL_ACCESS_ROOTS:
                 raise self.server.error(
-                    "Source path is read-only, cannot move: %s"
-                    % (source_base))
+                    f"Source path is read-only, cannot move: {source_base}")
             # if moving the file, make sure the source is not in use
             await self._handle_operation_check(source_path)
             try:
-                shutil.move(source_path, dest_path)
+                op_result = shutil.move(source_path, dest_path)
             except Exception as e:
                 raise self.server.error(str(e))
-            action = "file_move"
+            action = "move_item"
         elif path == "/server/files/copy":
             try:
                 if os.path.isdir(source_path):
-                    shutil.copytree(source_path, dest_path)
+                    op_result = shutil.copytree(source_path, dest_path)
                 else:
-                    shutil.copy2(source_path, dest_path)
+                    op_result = shutil.copy2(source_path, dest_path)
             except Exception as e:
                 raise self.server.error(str(e))
-            action = "file_copy"
+            action = "copy_item"
+        if op_result != dest_path:
+            dst_url_path = os.path.join(
+                dst_url_path, os.path.basename(op_result))
         self.notify_filelist_changed(
-            dst_url_path, action, dest_base,
-            {'prev_file': src_url_path, 'prev_root': source_base})
+            action, dst_url_path, dest_base,
+            {'path': src_url_path, 'root': source_base})
         return "ok"
 
     def _list_directory(self, path):
         if not os.path.isdir(path):
             raise self.server.error(
-                "Directory does not exist (%s)" % (path))
+                f"Directory does not exist ({path})")
         flist = {'dirs': [], 'files': []}
         for fname in os.listdir(path):
             full_path = os.path.join(path, fname)
-            modified = time.ctime(os.path.getmtime(full_path))
+            path_info = self._get_path_info(full_path)
             if os.path.isdir(full_path):
-                flist['dirs'].append({
-                    'dirname': fname,
-                    'modified': modified
-                })
+                path_info['dirname'] = fname
+                flist['dirs'].append(path_info)
             elif os.path.isfile(full_path):
-                size = os.path.getsize(full_path)
-                flist['files'].append(
-                    {'filename': fname,
-                     'modified': modified,
-                     'size': size})
+                path_info['filename'] = fname
+                flist['files'].append(path_info)
         return flist
+
+    def _get_path_info(self, path):
+        modified = time.ctime(os.path.getmtime(path))
+        size = os.path.getsize(path)
+        path_info = {'modified': modified, 'size': size}
+        return path_info
 
     def _shell_proc_callback(self, result):
         try:
@@ -284,14 +314,14 @@ class FileManager:
         # Use os.walk find files in sd path and subdirs
         path = self.file_paths.get(base, None)
         if path is None:
-            msg = "No known path for root: %s" % (base)
+            msg = f"No known path for root: {base}"
             logging.info(msg)
             raise self.server.error(msg)
         elif not os.path.isdir(path):
-            msg = "Cannot generate file list for root: %s" % (base)
+            msg = f"Cannot generate file list for root: {base}"
             logging.info(msg)
             raise self.server.error(msg)
-        logging.info("Updating File List <%s>..." % (base))
+        logging.info(f"Updating File List <{base}>...")
         new_list = {}
         for root, dirs, files in os.walk(path, followlinks=True):
             for name in files:
@@ -300,9 +330,7 @@ class FileManager:
                     continue
                 full_path = os.path.join(root, name)
                 r_path = full_path[len(path) + 1:]
-                size = os.path.getsize(full_path)
-                modified = time.ctime(os.path.getmtime(full_path))
-                new_list[r_path] = {'size': size, 'modified': modified}
+                new_list[r_path] = self._get_path_info(full_path)
         self.file_lists[base] = new_list
         if base == 'gcodes':
             ioloop = IOLoop.current()
@@ -317,7 +345,7 @@ class FileManager:
         elif root in FULL_ACCESS_ROOTS:
             result = self._do_standard_upload(request, root)
         else:
-            raise self.server.error("Invalid root request: %s" % (root))
+            raise self.server.error(f"Invalid root request: {root}")
         return result
 
     async def _do_gcode_upload(self, request):
@@ -351,16 +379,17 @@ class FileManager:
             except self.server.error:
                 # Attempt to start print failed
                 start_print = False
-        self.notify_filelist_changed(upload['filename'], 'added', "gcodes")
+        self.notify_filelist_changed(
+            'upload_file', upload['filename'], "gcodes")
         return {'result': upload['filename'], 'print_started': start_print}
 
     def _do_standard_upload(self, request, root):
         path = self.file_paths.get(root, None)
         if path is None:
-            raise self.server.error("Unknown root path: %s" % (root))
+            raise self.server.error(f"Unknown root path: {root}")
         upload = self._get_upload_info(request, path)
         self._write_file(upload)
-        self.notify_filelist_changed(upload['filename'], 'added', root)
+        self.notify_filelist_changed('upload_file', upload['filename'], root)
         return {'result': upload['filename']}
 
     def _get_argument(self, request, name, default=None):
@@ -393,7 +422,7 @@ class FileManager:
         # Validate the path.  Don't allow uploads to a parent of the root
         if not full_path.startswith(base_path):
             raise self.server.error(
-                "Cannot write to path: %s" % (full_path))
+                f"Cannot write to path: {full_path}")
         return {
             'filename': filename,
             'body': upload['body'],
@@ -446,7 +475,7 @@ class FileManager:
         root = parts[0]
         if root not in self.file_paths:
             raise self.server.error(
-                "Invalid Directory Request: %s" % (directory))
+                f"Invalid Directory Request: {directory}")
         path = self.file_paths[root]
         if len(parts) == 1:
             dir_path = path
@@ -454,7 +483,7 @@ class FileManager:
             dir_path = os.path.join(path, parts[1])
         if not os.path.isdir(dir_path):
             raise self.server.error(
-                "Directory does not exist (%s)" % (dir_path))
+                f"Directory does not exist ({dir_path})")
         flist = self._list_directory(dir_path)
         if simple_format:
             simple_list = []
@@ -472,19 +501,22 @@ class FileManager:
         parts = path.split("/", 1)
         root = parts[0]
         if root not in self.file_paths or len(parts) != 2:
-            raise self.server.error("Invalid file path: %s" % (path))
+            raise self.server.error(f"Invalid file path: {path}")
         root_path = self.file_paths[root]
         full_path = os.path.join(root_path, parts[1])
         if not os.path.isfile(full_path):
-            raise self.server.error("Invalid file path: %s" % (path))
+            raise self.server.error(f"Invalid file path: {path}")
         os.remove(full_path)
 
-    def notify_filelist_changed(self, fname, action, base, params={}):
+    def notify_filelist_changed(self, action, fname, base, source_item={}):
         self._update_file_list(base)
-        result = {'filename': fname, 'action': action, 'root': base}
-        if params:
-            result.update(params)
+        file_info = dict(self.file_lists[base].get(
+            fname, {'size': 0, 'modified': ""}))
+        file_info.update({'path': fname, 'root': base})
+        result = {'action': action, 'item': file_info}
+        if source_item:
+            result.update({'source_item': source_item})
         self.server.send_event("file_manager:filelist_changed", result)
 
-def load_plugin(server):
-    return FileManager(server)
+def load_plugin(config):
+    return FileManager(config)

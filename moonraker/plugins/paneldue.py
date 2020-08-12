@@ -9,9 +9,8 @@ import time
 import json
 import errno
 import logging
-import tempfile
 from utils import ServerError
-from tornado import gen, netutil
+from tornado import gen
 from tornado.ioloop import IOLoop
 from tornado.locks import Lock
 
@@ -21,28 +20,16 @@ class PanelDueError(ServerError):
     pass
 
 class SerialConnection:
-    def __init__(self, paneldue):
+    def __init__(self, config, paneldue):
         self.ioloop = IOLoop.current()
         self.paneldue = paneldue
-        self.port = ""
-        self.baud = 57200
+        self.port = config.get('serial')
+        self.baud = config.getint('baud', 57600)
         self.sendlock = Lock()
         self.partial_input = b""
         self.ser = self.fd = None
         self.connected = False
-
-    def load_config(self, config):
-        port = config.get('serial', None)
-        baud = int(config.get('baud', 57200))
-        if port is None:
-            logging.info("No serial port specified, cannot connect")
-            return
-        if port != self.port or baud != self.baud or \
-                not self.connected:
-            self.disconnect()
-            self.port = port
-            self.baud = baud
-            self.ioloop.spawn_callback(self._connect)
+        self.ioloop.spawn_callback(self._connect)
 
     def disconnect(self):
         if self.connected:
@@ -60,7 +47,7 @@ class SerialConnection:
             if connect_time > start_time + 30.:
                 logging.info("Unable to connect, aborting")
                 break
-            logging.info("Attempting to connect to: %s" % (self.port))
+            logging.info(f"Attempting to connect to: {self.port}")
             try:
                 # XXX - sometimes the port cannot be exclusively locked, this
                 # would likely be due to a restart where the serial port was
@@ -68,7 +55,7 @@ class SerialConnection:
                 self.ser = serial.Serial(
                     self.port, self.baud, timeout=0, exclusive=True)
             except (OSError, IOError, serial.SerialException):
-                logging.exception("Unable to open port: %s" % (self.port))
+                logging.exception(f"Unable to open port: {self.port}")
                 await gen.sleep(2.)
                 connect_time += time.time()
                 continue
@@ -137,13 +124,13 @@ class SerialConnection:
 
 
 class PanelDue:
-    def __init__(self, server):
-        self.server = server
+    def __init__(self, config):
+        self.server = config.get_server()
         self.ioloop = IOLoop.current()
-        self.ser_conn = SerialConnection(self)
-        self.file_manager = self.server.load_plugin('file_manager')
+        self.ser_conn = SerialConnection(config, self)
+        self.file_manager = self.server.lookup_plugin('file_manager')
         self.kinematics = "none"
-        self.machine_name = "Klipper"
+        self.machine_name = config.get('machine_name', "Klipper")
         self.firmware_name = "Repetier | Klipper"
         self.last_message = None
         self.last_gcode_response = None
@@ -153,13 +140,25 @@ class PanelDue:
         # Initialize tracked state.
         self.printer_state = {
             'gcode': {}, 'toolhead': {}, 'virtual_sdcard': {},
-            'pause_resume': {}, 'fan': {}, 'display_status': {}}
-        self.available_macros = {}
-        self.non_trivial_keys = []
+            'fan': {}, 'display_status': {}, 'print_stats': {}}
         self.extruder_count = 0
         self.heaters = []
         self.is_ready = False
         self.is_shutdown = False
+        self.last_printer_state = 'C'
+
+        # Set up macros
+        self.available_macros = {}
+        macros = config.get('macros', None)
+        if macros is not None:
+            # The macro's configuration name is the key, whereas the full
+            # command is the value
+            macros = [m for m in macros.split('\n') if m.strip()]
+            self.available_macros = {m.split()[0]: m for m in macros}
+
+        ntkeys = config.get('non_trivial_keys', "Klipper state")
+        self.non_trivial_keys = [k for k in ntkeys.split('\n') if k.strip()]
+        logging.info("PanelDue Configured")
 
         # Register server events
         self.server.register_event_handler(
@@ -196,23 +195,6 @@ class PanelDue:
             'M999': lambda args: "FIRMWARE_RESTART"
         }
 
-    def load_config(self, config):
-        self.ser_conn.load_config(config)
-        self.machine_name = config.get('machine_name', self.machine_name)
-        macros = config.get('macros', None)
-        if macros is not None:
-            # The macro's configuration name is the key, whereas the full
-            # command is the value
-            macros = [m for m in macros.split('\n') if m.strip()]
-            self.available_macros = {m.split()[0]: m for m in macros}
-        else:
-            self.available_macros = {}
-
-        ntkeys = config.get('non_trivial_keys', "Klipper state")
-        self.non_trivial_keys = [k for k in ntkeys.split('\n') if k.strip()]
-        self.ioloop.spawn_callback(self.write_response, {'status': 'C'})
-        logging.info("PanelDue Configured")
-
     async def _klippy_request(self, command, method='GET', args={}):
         request = self.server.make_request(command, method, args)
         result = await request.wait()
@@ -221,6 +203,7 @@ class PanelDue:
         return result
 
     async def handle_klippy_state(self, state):
+        # XXX - Add a "connected" state and send a "C" to paneldue?
         if state == "ready":
             await self._process_klippy_ready()
         elif state == "shutdown":
@@ -231,6 +214,7 @@ class PanelDue:
     async def _process_klippy_ready(self):
         # Request "info" and "configfile" status
         retries = 10
+        printer_info = cfg_status = {}
         while retries:
             try:
                 printer_info = await self._klippy_request("info")
@@ -251,17 +235,16 @@ class PanelDue:
         self.kinematics = printer_cfg.get('kinematics', "none")
 
         logging.info(
-            "PanelDue Config Received:\n"
-            "Firmware Name: %s\n"
-            "Kinematics: %s\n"
-            "Printer Config: %s\n"
-            % (self.firmware_name, self.kinematics, str(config)))
+            f"PanelDue Config Received:\n"
+            f"Firmware Name: {self.firmware_name}\n"
+            f"Kinematics: {self.kinematics}\n"
+            f"Printer Config: {config}\n")
 
         # Initalize printer state and make subscription request
         self.printer_state = {
             'gcode': {}, 'toolhead': {}, 'virtual_sdcard': {},
-            'pause_resume': {}, 'fan': {}, 'display_status': {}}
-        sub_args = {'gcode': [], 'toolhead': []}
+            'fan': {}, 'display_status': {}, 'print_stats': {}}
+        sub_args = {k: [] for k in self.printer_state.keys()}
         self.extruder_count = 0
         self.heaters = []
         for cfg in config:
@@ -273,8 +256,6 @@ class PanelDue:
             elif cfg == "heater_bed":
                 self.printer_state[cfg] = {}
                 self.heaters.append(cfg)
-                sub_args[cfg] = []
-            elif cfg in self.printer_state:
                 sub_args[cfg] = []
         try:
             await self._klippy_request(
@@ -323,7 +304,7 @@ class PanelDue:
             # Invalid checksum, do not process
             msg = "!! Invalid Checksum"
             if line_no is not None:
-                msg = " Line Number: %d" % line_no
+                msg += f" Line Number: {line_no}"
             logging.exception("PanelDue: " + msg)
             raise PanelDueError(msg)
 
@@ -335,7 +316,7 @@ class PanelDue:
         if calculated_cs & 0xFF != checksum:
             msg = "!! Invalid Checksum"
             if line_no is not None:
-                msg = " Line Number: %d" % line_no
+                msg += f" Line Number: {line_no}"
             logging.info("PanelDue: " + msg)
             raise PanelDueError(msg)
 
@@ -355,7 +336,7 @@ class PanelDue:
                 try:
                     val = int(p[1:].strip()) if arg in "sr" else p[1:].strip()
                 except Exception:
-                    msg = "paneldue: Error parsing direct gcode %s" % (script)
+                    msg = f"paneldue: Error parsing direct gcode {script}"
                     self.handle_gcode_response("!! " + msg)
                     logging.exception(msg)
                     return
@@ -374,7 +355,7 @@ class PanelDue:
             await self._klippy_request(
                 "gcode/script", method='POST', args=args)
         except PanelDueError:
-            msg = "Error executing script %s" % script
+            msg = f"Error executing script {script}"
             self.handle_gcode_response("!! " + msg)
             logging.exception(msg)
 
@@ -400,7 +381,7 @@ class PanelDue:
 
     def _prepare_M32(self, args):
         filename = self._clean_filename(args[0].strip())
-        return "M23 " + filename + "\n" + "M24"
+        return "SDCARD_PRINT_FILE FILENAME=" + filename
 
     def _prepare_M98(self, args):
         macro = args[0][1:].strip()
@@ -408,13 +389,13 @@ class PanelDue:
         macro = macro[name_start:]
         cmd = self.available_macros.get(macro)
         if cmd is None:
-            raise PanelDueError("Macro %s invalid" % (macro))
+            raise PanelDueError(f"Macro {macro} invalid")
         return cmd
 
     def _prepare_M290(self, args):
         # args should in in the format Z0.02
         offset = args[0][1:].strip()
-        return "SET_GCODE_OFFSET Z_ADJUST=%s MOVE=1" % (offset)
+        return f"SET_GCODE_OFFSET Z_ADJUST={offset} MOVE=1"
 
     def handle_gcode_response(self, response):
         # Only queue up "non-trivial" gcode responses.  At the
@@ -441,18 +422,25 @@ class PanelDue:
             return 'S'
 
         printer_state = self.printer_state
-        is_active = printer_state['virtual_sdcard'].get('is_active', False)
-        paused = printer_state['pause_resume'].get('is_paused', False)
-        if paused:
-            if is_active:
+        th_busy = printer_state['toolhead'].get(
+            'status', 'Ready') == "Printing"
+        sd_state = printer_state['print_stats'].get('state', "standby")
+        if sd_state == "printing":
+            if self.last_printer_state == 'A':
+                # Resuming
+                return 'R'
+            # Printing
+            return 'P'
+        elif sd_state == "paused":
+            if th_busy and self.last_printer_state != 'A':
+                # Pausing
                 return 'D'
             else:
+                # Paused
                 return 'A'
 
-        if is_active:
-            return 'P'
-
-        if printer_state['gcode'].get('busy', False):
+        if th_busy:
+            # Printer is "busy"
             return 'B'
 
         return 'I'
@@ -464,7 +452,8 @@ class PanelDue:
 
         if not self.is_ready:
             # Klipper is still starting up, do not query status
-            response['status'] = 'S' if self.is_shutdown else 'C'
+            self.last_printer_state = 'S' if self.is_shutdown else 'C'
+            response['status'] = self.last_printer_state
             await self.write_response(response)
             return
 
@@ -483,8 +472,8 @@ class PanelDue:
             response['axes'] = 3
 
         p_state = self.printer_state
-        status = self._get_printer_status()
-        response['status'] = status
+        self.last_printer_state = self._get_printer_status()
+        response['status'] = self.last_printer_state
         response['babystep'] = round(p_state['gcode'].get(
             'homing_zpos', 0.), 3)
 
@@ -498,13 +487,15 @@ class PanelDue:
 
         # Print Progress Tracking
         sd_status = p_state['virtual_sdcard']
-        fname = sd_status.get('filename', "")
-        if fname:
+        print_stats = p_state['print_stats']
+        fname = print_stats.get('filename', "")
+        sd_print_state = print_stats.get('state')
+        if sd_print_state in ['printing', 'paused']:
             # We know a file has been loaded, initialize metadata
             if self.current_file != fname:
                 self.current_file = fname
                 self.file_metadata = self.file_manager.get_file_metadata(fname)
-            progress = p_state['virtual_sdcard'].get('progress', 0)
+            progress = sd_status.get('progress', 0)
             # progress and print tracking
             if progress:
                 response['fraction_printed'] = round(progress, 3)
@@ -515,7 +506,7 @@ class PanelDue:
                     # filament estimate
                     est_total_fil = self.file_metadata.get('filament_total')
                     if est_total_fil:
-                        cur_filament = sd_status.get('filament_used', 0.)
+                        cur_filament = print_stats.get('filament_used', 0.)
                         fpct = min(1., cur_filament / est_total_fil)
                         times_left.append(int(est_time - est_time * fpct))
                     # object height estimate
@@ -527,7 +518,7 @@ class PanelDue:
                 else:
                     # The estimated time is not in the metadata, however we
                     # can still provide an estimate based on file progress
-                    duration = sd_status.get('print_duration', 0.)
+                    duration = print_stats.get('print_duration', 0.)
                     times_left = [int(duration / progress - duration)]
                 response['timesLeft'] = times_left
         else:
@@ -575,8 +566,7 @@ class PanelDue:
         response_type = arg_s
         if response_type != 2:
             logging.info(
-                "PanelDue: Cannot process response type %d in M20"
-                % (response_type))
+                f"Cannot process response type {response_type} in M20")
             return
         path = arg_p
 
@@ -630,12 +620,13 @@ class PanelDue:
         response = {}
         filename = arg_p
         sd_status = self.printer_state.get('virtual_sdcard', {})
+        print_stats = self.printer_state.get('print_stats', {})
         if filename is None:
             # PanelDue is requesting file information on a
             # currently printed file
             active = False
-            if sd_status:
-                filename = sd_status['filename']
+            if sd_status and print_stats:
+                filename = print_stats['filename']
                 active = sd_status['is_active']
             if not filename or not active:
                 # Either no file printing or no virtual_sdcard
@@ -681,5 +672,5 @@ class PanelDue:
     async def close(self):
         self.ser_conn.disconnect()
 
-def load_plugin(server):
-    return PanelDue(server)
+def load_plugin(config):
+    return PanelDue(config)

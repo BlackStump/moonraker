@@ -21,7 +21,7 @@ MAX_UPLOAD_SIZE = 200 * 1024 * 1024
 # These endpoints are reserved for klippy/server communication only and are
 # not exposed via http or the websocket
 RESERVED_ENDPOINTS = [
-    "list_endpoints", "moonraker/get_configuration"
+    "list_endpoints", "moonraker/check_available"
 ]
 
 
@@ -77,7 +77,7 @@ class MutableRouter(tornado.web.ReversibleRuleRouter):
             try:
                 self.rules.remove(rule)
             except Exception:
-                logging.exception("Unable to remove rule: %s" % (pattern))
+                logging.exception(f"Unable to remove rule: {pattern}")
 
 class APIDefinition:
     def __init__(self, endpoint, http_uri, ws_method,
@@ -91,19 +91,22 @@ class APIDefinition:
         self.parser = parser
 
 class MoonrakerApp:
-    def __init__(self, server, args):
-        self.server = server
+    def __init__(self, config):
+        self.server = config.get_server()
         self.tornado_server = None
         self.api_cache = {}
         self.registered_base_handlers = []
 
         # Set Up Websocket and Authorization Managers
-        self.wsm = WebsocketManager(server)
-        self.auth = Authorization(args.apikey)
+        self.wsm = WebsocketManager(self.server)
+        self.auth = Authorization(config['authorization'])
 
         mimetypes.add_type('text/plain', '.log')
         mimetypes.add_type('text/plain', '.gcode')
         mimetypes.add_type('text/plain', '.cfg')
+
+        debug = config.getboolean('enable_debug_logging', True)
+        enable_cors = config.getboolean('enable_cors', False)
 
         # Set up HTTP only requests
         self.mutable_router = MutableRouter(self)
@@ -112,18 +115,19 @@ class MoonrakerApp:
             (r"/websocket", WebSocket,
              {'wsm': self.wsm, 'auth': self.auth}),
             (r"/api/version", EmulateOctoprintHandler,
-             {'server': server, 'auth': self.auth})]
+             {'server': self.server, 'auth': self.auth})]
 
         self.app = tornado.web.Application(
             app_handlers,
-            serve_traceback=args.debug,
+            serve_traceback=debug,
             websocket_ping_interval=10,
             websocket_ping_timeout=30,
-            enable_cors=False)
+            enable_cors=enable_cors)
         self.get_handler_delegate = self.app.get_handler_delegate
 
         # Register handlers
-        self.register_static_file_handler("moonraker.log", args.logfile)
+        logfile = config['cmd_args'].get('logfile')
+        self.register_static_file_handler("moonraker.log", logfile)
         self.auth.register_handlers(self)
 
     def listen(self, host, port):
@@ -137,11 +141,6 @@ class MoonrakerApp:
         await self.wsm.close()
         self.auth.close()
 
-    def load_config(self, config):
-        if 'enable_cors' in config:
-            self.app.settings['enable_cors'] = config['enable_cors']
-        self.auth.load_config(config)
-
     def register_remote_handler(self, endpoint):
         if endpoint in RESERVED_ENDPOINTS:
             return
@@ -150,8 +149,9 @@ class MoonrakerApp:
         if api_def.uri in self.registered_base_handlers:
             # reserved handler or already registered
             return
-        logging.info("Registering remote endpoint: (%s) %s" % (
-            " ".join(api_def.request_methods), api_def.uri))
+        logging.info(
+            f"Registering remote endpoint: "
+            f"({' '.join(api_def.request_methods)}) {api_def.uri}")
         self.wsm.register_handler(api_def)
         params = {}
         params['server'] = self.server
@@ -169,8 +169,9 @@ class MoonrakerApp:
             return
         api_def = self._create_api_definition(
             uri, ws_method, request_methods)
-        logging.info("Registering local endpoint: (%s) %s" % (
-            " ".join(request_methods), uri))
+        logging.info(
+            f"Registering local endpoint: "
+            f"({' '.join(request_methods)}) {uri}")
         if not http_only:
             self.wsm.register_handler(api_def, callback)
         params = {}
@@ -193,8 +194,9 @@ class MoonrakerApp:
                 pattern += "/"
             pattern += "(.*)"
         else:
-            logging.info("Invalid file path: %s" % (file_path))
+            logging.info(f"Invalid file path: {file_path}")
             return
+        logging.debug(f"Registering static file: ({pattern}) {file_path}")
         methods = ['GET']
         if can_delete:
             methods.append('DELETE')
@@ -317,7 +319,7 @@ class FileRequestHandler(AuthorizedFileHandler):
         # a file
         basename = os.path.basename(self.absolute_path)
         self.set_header(
-            "Content-Disposition", "attachment; filename=%s" % (basename))
+            "Content-Disposition", f"attachment; filename={basename}")
 
     async def delete(self, path):
         if 'DELETE' not in self.methods:
@@ -342,7 +344,7 @@ class FileRequestHandler(AuthorizedFileHandler):
         base = self.request.path.lstrip("/").split("/")[2]
         filename = self.path.lstrip("/")
         file_manager = self.server.lookup_plugin('file_manager')
-        file_manager.notify_filelist_changed(filename, 'removed', base)
+        file_manager.notify_filelist_changed('delete_file', filename, base)
         self.finish({'result': filename})
 
 class FileUploadHandler(AuthorizedRequestHandler):

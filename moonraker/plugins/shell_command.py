@@ -50,7 +50,7 @@ class ShellCommand:
                 self.command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         except Exception:
             logging.exception(
-                "shell_command: Command {%s} failed" % (self.name))
+                f"shell_command: Command ({self.name}) failed")
             return
         if verbose:
             fd = proc.stdout.fileno()
@@ -74,9 +74,9 @@ class ShellCommand:
                 self.output_cb(self.partial_output)
                 self.partial_output = b""
             if complete:
-                msg = "Command {%s} finished" % (self.name)
+                msg = f"Command ({self.name}) finished"
             else:
-                msg = "Command {%s} timed out" % (self.name)
+                msg = f"Command ({self.name}) timed out"
             logging.info(msg)
             self.io_loop.remove_handler(fd)
 
@@ -84,5 +84,5 @@ class ShellCommandFactory:
     def build_shell_command(self, cmd, callback):
         return ShellCommand(cmd, callback)
 
-def load_plugin(server):
+def load_plugin(config):
     return ShellCommandFactory()

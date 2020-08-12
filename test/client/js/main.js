@@ -264,7 +264,8 @@ function get_klippy_info() {
                         virtual_sdcard: [],
                         heater_bed: [],
                         extruder: ["temperature", "target"],
-                        fan: []};
+                        fan: [],
+                        print_stats: []};
                     add_subscription(sub);
                 } else {
                     get_status({idle_timeout: [], pause_resume: []});
@@ -285,6 +286,9 @@ function get_klippy_info() {
     })
     .catch((error) => {
         update_error(api.printer_info.method, error);
+        setTimeout(() => {
+            get_klippy_info();
+        }, 2000);
     });
 }
 
@@ -522,7 +526,7 @@ function handle_status_update(status) {
             let full_name = name + "." + attr;
             let val = obj[attr];
             switch(full_name) {
-                case "virtual_sdcard.filename":
+                case "print_stats.filename":
                     $('#filename').prop("hidden", val == "");
                     $('#filename').text("Loaded File: " + val);
                     break;
@@ -593,8 +597,8 @@ json_rpc.register_method("notify_klippy_state_changed", handle_klippy_state);
 function handle_file_list_changed(file_info) {
     // This event fires when a client has either added or removed
     // a gcode file.
-    if (file_list_type == file_info.root)
-        get_file_list(file_info.root);
+    if (file_list_type == file_info.item.root)
+        get_file_list(file_info.item.root);
     console.log("Filelist Changed:");
     console.log(file_info);
 }
@@ -1142,7 +1146,8 @@ window.onload = () => {
      $('#btnsubscribe').click(() => {
         if (api_type == 'http') {
             let url = api.object_subscription.url + "?gcode=gcode_position,speed,speed_factor,extrude_factor" +
-                    "&toolhead&virtual_sdcard&heater_bed&extruder=temperature,target&fan&idle_timeout&pause_resume";
+                    "&toolhead&virtual_sdcard&heater_bed&extruder=temperature,target&fan&idle_timeout&pause_resume"  +
+                    "&print_stats";
             let settings = {url: url};
             if (apikey != null)
                 settings.headers = {"X-Api-Key": apikey};
@@ -1158,7 +1163,8 @@ window.onload = () => {
                 virtual_sdcard: [],
                 heater_bed: [],
                 extruder: ["temperature", "target"],
-                fan: []};
+                fan: [],
+                print_stats: []};
             add_subscription(sub);
         }
     });
