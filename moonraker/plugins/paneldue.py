@@ -19,6 +19,8 @@ MIN_EST_TIME = 10.
 class PanelDueError(ServerError):
     pass
 
+RESTART_GCODES = ["RESTART", "FIRMWARE_RESTART"]
+
 class SerialConnection:
     def __init__(self, config, paneldue):
         self.ioloop = IOLoop.current()
@@ -129,6 +131,7 @@ class PanelDue:
         self.ioloop = IOLoop.current()
         self.ser_conn = SerialConnection(config, self)
         self.file_manager = self.server.lookup_plugin('file_manager')
+        self.klippy_apis = self.server.lookup_plugin('klippy_apis')
         self.kinematics = "none"
         self.machine_name = config.get('machine_name', "Klipper")
         self.firmware_name = "Repetier | Klipper"
@@ -174,7 +177,11 @@ class PanelDue:
 
         # Register server events
         self.server.register_event_handler(
-            "server:klippy_state_changed", self.handle_klippy_state)
+            "server:klippy_ready", self._process_klippy_ready)
+        self.server.register_event_handler(
+            "server:klippy_shutdown", self._process_klippy_shutdown)
+        self.server.register_event_handler(
+            "server:klippy_disconnect", self._process_klippy_disconnect)
         self.server.register_event_handler(
             "server:status_update", self.handle_status_update)
         self.server.register_event_handler(
@@ -208,37 +215,16 @@ class PanelDue:
             'M999': lambda args: "FIRMWARE_RESTART"
         }
 
-    async def _klippy_request(self, command, method='GET', args={}):
-        try:
-            result = await self.server.make_request(command, method, args)
-        except self.server.error as e:
-            script = args.get('script', "")
-            if script in ["RESTART", "FIRMWARE_RESTART"] and \
-                    str(e) == "Klippy Disconnected":
-                result = "ok"
-            else:
-                raise PanelDueError(str(e)) from e
-        return result
-
-    async def handle_klippy_state(self, state):
-        # XXX - Add a "connected" state and send a "C" to paneldue?
-        if state == "ready":
-            await self._process_klippy_ready()
-        elif state == "shutdown":
-            await self._process_klippy_shutdown()
-        elif state == "disconnect":
-            await self._process_klippy_disconnect()
-
     async def _process_klippy_ready(self):
         # Request "info" and "configfile" status
         retries = 10
         printer_info = cfg_status = {}
         while retries:
             try:
-                printer_info = await self._klippy_request("info")
-                cfg_status = await self._klippy_request(
-                    "objects/status", args={'configfile': []})
-            except PanelDueError:
+                printer_info = await self.klippy_apis.get_klippy_info()
+                cfg_status = await self.klippy_apis.query_objects(
+                    {'configfile': None})
+            except self.server.error:
                 logging.exception("PanelDue initialization request failed")
                 retries -= 1
                 if not retries:
@@ -247,7 +233,8 @@ class PanelDue:
                 continue
             break
 
-        self.firmware_name = "Repetier | Klipper " + printer_info['version']
+        self.firmware_name = "Repetier | Klipper " + \
+            printer_info['software_version']
         config = cfg_status.get('configfile', {}).get('config', {})
         printer_cfg = config.get('printer', {})
         self.kinematics = printer_cfg.get('kinematics', "none")
@@ -262,7 +249,7 @@ class PanelDue:
         self.printer_state = {
             'gcode': {}, 'toolhead': {}, 'virtual_sdcard': {},
             'fan': {}, 'display_status': {}, 'print_stats': {}}
-        sub_args = {k: [] for k in self.printer_state.keys()}
+        sub_args = {k: None for k in self.printer_state.keys()}
         self.extruder_count = 0
         self.heaters = []
         for cfg in config:
@@ -270,16 +257,17 @@ class PanelDue:
                 self.extruder_count += 1
                 self.printer_state[cfg] = {}
                 self.heaters.append(cfg)
-                sub_args[cfg] = []
+                sub_args[cfg] = None
             elif cfg == "heater_bed":
                 self.printer_state[cfg] = {}
                 self.heaters.append(cfg)
-                sub_args[cfg] = []
+                sub_args[cfg] = None
         try:
-            await self._klippy_request(
-                "objects/subscription", method='POST', args=sub_args)
-        except PanelDueError:
+            status = await self.klippy_apis.subscribe_objects(sub_args)
+        except self.server.error:
             logging.exception("Unable to complete subscription request")
+        else:
+            self.printer_state.update(status)
         self.is_shutdown = False
         self.is_ready = True
 
@@ -303,7 +291,7 @@ class PanelDue:
     async def process_line(self, line):
         # If we find M112 in the line then skip verification
         if "M112" in line.upper():
-            await self._klippy_request("emergency_stop", method='POST')
+            await self.klippy_apis.emergency_stop()
             return
 
         # Get line number
@@ -370,12 +358,13 @@ class PanelDue:
 
         if not script:
             return
+        elif script in RESTART_GCODES:
+            await self.klippy_apis.do_restart(script)
+            return
 
         try:
-            args = {'script': script}
-            await self._klippy_request(
-                "gcode/script", method='POST', args=args)
-        except PanelDueError:
+            await self.klippy_apis.run_gcode(script)
+        except self.server.error:
             msg = f"Error executing script {script}"
             self.handle_gcode_response("!! " + msg)
             logging.exception(msg)

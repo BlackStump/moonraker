@@ -45,14 +45,14 @@ var api = {
         method: "get_printer_objects_list"
     },
     object_status: {
-        url: "/printer/objects/status",
-        method: "get_printer_objects_status"
+        url: "/printer/objects/query",
+        method: "get_printer_objects_query"
     },
     object_subscription: {
-        url: "/printer/objects/subscription",
+        url: "/printer/objects/subscribe",
         method: {
-            post: "post_printer_objects_subscription",
-            get: "get_printer_objects_subscription"
+            post: "post_printer_objects_subscribe",
+            get: "get_printer_objects_subscribe"
         },
     },
     temperature_store: {
@@ -218,6 +218,28 @@ function update_error(cmd, msg) {
     update_term("Command [" + cmd + "] resulted in an error: " + msg);
     console.log("Error processing " + cmd +": " + msg);
 }
+
+function handle_klippy_state(state) {
+    // Klippy state can be "ready", "disconnect", and "shutdown".  This
+    // differs from Printer State in that it represents the status of
+    // the Host software
+    switch(state) {
+        case "ready":
+            // It would be possible to use this event to notify the
+            // client that the printer has started, however the server
+            // may not start in time for clients to receive this event.
+            // It is being kept in case
+            if (!klippy_ready)
+                update_term("Klippy Ready");
+            break;
+        case "shutdown":
+            // Either M112 was entered or there was a printer error.  We
+            // probably want to notify the user and disable certain controls.
+            klippy_ready = false;
+            update_term("Klipper has shutdown, check klippy.log for info");
+            break;
+    }
+}
 //***********End UI Update Functions****************/
 
 //***********Websocket-Klipper API Functions (JSON-RPC)************/
@@ -243,11 +265,11 @@ function get_klippy_info() {
     json_rpc.call_method(api.printer_info.method)
     .then((result) => {
 
-        if (result.is_ready) {
+        if (result.state == "ready") {
             if (!klippy_ready) {
                 update_term("Klippy Hostname: " + result.hostname +
-                    " | CPU: " + result.cpu +
-                    " | Build Version: " + result.version);
+                    " | CPU: " + result.cpu_info +
+                    " | Build Version: " + result.software_version);
                 klippy_ready = true;
                 // Klippy has transitioned from not ready to ready.
                 // It is now safe to fetch the file list.
@@ -257,23 +279,25 @@ function get_klippy_info() {
                 if ($("#cbxSub").is(":checked")) {
                     // If autosubscribe is check, request the subscription now
                     const sub = {
-                        gcode: ["gcode_position", "speed", "speed_factor", "extrude_factor"],
-                        idle_timeout: [],
-                        pause_resume: [],
-                        toolhead: [],
-                        virtual_sdcard: [],
-                        heater_bed: [],
-                        extruder: ["temperature", "target"],
-                        fan: [],
-                        print_stats: []};
+                        objects: {
+                            gcode: ["gcode_position", "speed", "speed_factor", "extrude_factor"],
+                            idle_timeout: null,
+                            pause_resume: null,
+                            toolhead: null,
+                            virtual_sdcard: null,
+                            heater_bed: null,
+                            extruder: ["temperature", "target"],
+                            fan: null,
+                            print_stats: null}
+                        };
                     add_subscription(sub);
                 } else {
-                    get_status({idle_timeout: [], pause_resume: []});
+                    get_status({idle_timeout: null, pause_resume: null});
                 }
             }
         } else {
-            if (result.error_detected) {
-                update_term(result.message);
+            if (result.state == "error") {
+                update_term(result.state_message);
             } else {
                 update_term("Waiting for Klippy ready status...");
             }
@@ -341,7 +365,7 @@ function get_status(printer_objects) {
     });
 }
 
-function get_object_info() {
+function get_object_list() {
     json_rpc.call_method(api.object_list.method)
     .then((result) => {
         // result will be a dictionary containing all available printer
@@ -357,8 +381,8 @@ function add_subscription(printer_objects) {
     json_rpc.call_method_with_kwargs(
         api.object_subscription.method.post, printer_objects)
     .then((result) => {
-        // result is simply an "ok" acknowledgement that subscriptions
-        // have been added for requested objects
+        // result is the the state from all fetched data
+        handle_status_update(result.status)
         console.log(result);
     })
     .catch((error) => {
@@ -551,6 +575,8 @@ function handle_status_update(status) {
                         update_streamdiv(name, attr, val);
                     }
                     break;
+                case "webhooks.state":
+                    handle_klippy_state(val);
                 default:
                     update_streamdiv(name, attr, val);
 
@@ -560,39 +586,19 @@ function handle_status_update(status) {
 }
 json_rpc.register_method("notify_status_update", handle_status_update);
 
-function handle_klippy_state(state) {
-    // Klippy state can be "ready", "disconnect", and "shutdown".  This
-    // differs from Printer State in that it represents the status of
-    // the Host software
-    switch(state) {
-        case "ready":
-            // It would be possible to use this event to notify the
-            // client that the printer has started, however the server
-            // may not start in time for clients to receive this event.
-            // It is being kept in case
-            update_term("Klippy Ready");
-            break;
-        case "disconnect":
-            // Klippy has disconnected from the MCU and is prepping to
-            // restart.  The client will receive this signal right before
-            // the websocket disconnects.  If we need to do any kind of
-            // cleanup on the client to prepare for restart this would
-            // be a good place.
-            klippy_ready = false;
-            update_term("Klippy Disconnected");
-            setTimeout(() => {
-                get_klippy_info();
-            }, 2000);
-            break;
-        case "shutdown":
-            // Either M112 was entered or there was a printer error.  We
-            // probably want to notify the user and disable certain controls.
-            klippy_ready = false;
-            update_term("Klipper has shutdown, check klippy.log for info");
-            break;
-    }
+function handle_klippy_disconnected() {
+    // Klippy has disconnected from the MCU and is prepping to
+    // restart.  The client will receive this signal right before
+    // the websocket disconnects.  If we need to do any kind of
+    // cleanup on the client to prepare for restart this would
+    // be a good place.
+    klippy_ready = false;
+    update_term("Klippy Disconnected");
+    setTimeout(() => {
+        get_klippy_info();
+    }, 2000);
 }
-json_rpc.register_method("notify_klippy_state_changed", handle_klippy_state);
+json_rpc.register_method("notify_klippy_disconnected", handle_klippy_disconnected);
 
 function handle_file_list_changed(file_info) {
     // This event fires when a client has either added or removed
@@ -1156,15 +1162,17 @@ window.onload = () => {
             });
         } else {
             const sub = {
-                gcode: ["gcode_position", "speed", "speed_factor", "extrude_factor"],
-                idle_timeout: [],
-                pause_resume: [],
-                toolhead: [],
-                virtual_sdcard: [],
-                heater_bed: [],
-                extruder: ["temperature", "target"],
-                fan: [],
-                print_stats: []};
+                objects: {
+                    gcode: ["gcode_position", "speed", "speed_factor", "extrude_factor"],
+                    idle_timeout: null,
+                    pause_resume: null,
+                    toolhead: null,
+                    virtual_sdcard: null,
+                    heater_bed: null,
+                    extruder: ["temperature", "target"],
+                    fan: null,
+                    print_stats: null}
+                };
             add_subscription(sub);
         }
     });
@@ -1207,7 +1215,7 @@ window.onload = () => {
                 return false;
             });
         } else {
-            get_object_info();
+            get_object_list();
         }
     });
 

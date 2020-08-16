@@ -11,6 +11,9 @@ from tornado.ioloop import IOLoop
 from tornado.websocket import WebSocketHandler, WebSocketClosedError
 from utils import ServerError
 
+class Sentinel:
+    pass
+
 class JsonRPC:
     def __init__(self):
         self.methods = {}
@@ -105,7 +108,7 @@ class WebsocketManager:
 
         # Register events
         self.server.register_event_handler(
-            "server:klippy_state_changed", self._handle_klippy_state_changed)
+            "server:klippy_disconnect", self._handle_klippy_disconnect)
         self.server.register_event_handler(
             "server:gcode_response", self._handle_gcode_response)
         self.server.register_event_handler(
@@ -113,8 +116,8 @@ class WebsocketManager:
         self.server.register_event_handler(
             "file_manager:filelist_changed", self._handle_filelist_changed)
 
-    async def _handle_klippy_state_changed(self, state):
-        await self.notify_websockets("klippy_state_changed", state)
+    async def _handle_klippy_disconnect(self):
+        await self.notify_websockets("klippy_disconnected")
 
     async def _handle_gcode_response(self, response):
         await self.notify_websockets("gcode_response", response)
@@ -134,17 +137,16 @@ class WebsocketManager:
                     api_def.endpoint, r_method, callback)
             else:
                 # Callback is a remote method
-                rpc_cb = self._generate_callback(api_def.endpoint, r_method)
+                rpc_cb = self._generate_callback(api_def.endpoint)
             self.rpc.register_method(cmd, rpc_cb)
 
     def remove_handler(self, ws_method):
         for prefix in ["get", "post", "delete"]:
             self.rpc.remove_method(prefix + "_" + ws_method)
 
-    def _generate_callback(self, endpoint, request_method):
+    def _generate_callback(self, endpoint):
         async def func(**kwargs):
-            result = await self.server.make_request(
-                endpoint, request_method, kwargs)
+            result = await self.server.make_request(endpoint, kwargs)
             return result
         return func
 
@@ -172,11 +174,11 @@ class WebsocketManager:
             if old_ws is not None:
                 logging.info(f"Websocket Removed: {ws.uid}")
 
-    async def notify_websockets(self, name, data):
-        notification = json.dumps({
-            'jsonrpc': "2.0",
-            'method': "notify_" + name,
-            'params': [data]})
+    async def notify_websockets(self, name, data=Sentinel):
+        msg = {'jsonrpc': "2.0", 'method': "notify_" + name}
+        if data != Sentinel:
+            msg['params'] = [data]
+        notification = json.dumps(msg)
         async with self.ws_lock:
             for ws in list(self.websockets.values()):
                 try:

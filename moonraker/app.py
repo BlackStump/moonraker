@@ -21,7 +21,7 @@ MAX_UPLOAD_SIZE = 200 * 1024 * 1024
 # These endpoints are reserved for klippy/server communication only and are
 # not exposed via http or the websocket
 RESERVED_ENDPOINTS = [
-    "list_endpoints", "moonraker/check_available"
+    "list_endpoints", "gcode/subscribe_output"
 ]
 
 
@@ -34,8 +34,10 @@ def _status_parser(request):
         for v in vals:
             if v:
                 parsed += v.decode().split(',')
+        if parsed == []:
+            parsed = None
         args[key] = parsed
-    return args
+    return {'objects': args}
 
 # Built-in Query String Parser
 def _default_parser(request):
@@ -156,7 +158,6 @@ class MoonrakerApp:
         params = {}
         params['server'] = self.server
         params['auth'] = self.auth
-        params['methods'] = api_def.request_methods
         params['arg_parser'] = api_def.parser
         params['remote_callback'] = api_def.endpoint
         self.mutable_router.add_handler(
@@ -236,32 +237,24 @@ class MoonrakerApp:
 
 # ***** Dynamic Handlers*****
 class RemoteRequestHandler(AuthorizedRequestHandler):
-    def initialize(self, remote_callback, server, auth,
-                   methods, arg_parser):
+    def initialize(self, remote_callback, server, auth, arg_parser):
         super(RemoteRequestHandler, self).initialize(server, auth)
         self.remote_callback = remote_callback
-        self.methods = methods
         self.query_parser = arg_parser
 
     async def get(self):
-        if 'GET' in self.methods:
-            await self._process_http_request('GET')
-        else:
-            raise tornado.web.HTTPError(405)
+        await self._process_http_request()
 
     async def post(self):
-        if 'POST' in self.methods:
-            await self._process_http_request('POST')
-        else:
-            raise tornado.web.HTTPError(405)
+        await self._process_http_request()
 
-    async def _process_http_request(self, method):
+    async def _process_http_request(self):
         args = {}
         if self.request.query:
             args = self.query_parser(self.request)
         try:
             result = await self.server.make_request(
-                self.remote_callback, method, args)
+                self.remote_callback, args)
         except ServerError as e:
             raise tornado.web.HTTPError(
                 e.status_code, str(e)) from e
