@@ -142,8 +142,9 @@ class PanelDue:
 
         # Initialize tracked state.
         self.printer_state = {
-            'gcode': {}, 'toolhead': {}, 'virtual_sdcard': {},
-            'fan': {}, 'display_status': {}, 'print_stats': {}}
+            'gcode_move': {}, 'toolhead': {}, 'virtual_sdcard': {},
+            'fan': {}, 'display_status': {}, 'print_stats': {},
+            'idle_timeout': {}, 'gcode_macro PANELDUE_BEEP': {}}
         self.extruder_count = 0
         self.heaters = []
         self.is_ready = False
@@ -153,6 +154,7 @@ class PanelDue:
         # Set up macros
         self.confirmed_gcode = ""
         self.mbox_sequence = 0
+        self.beep_sequence = 0
         self.available_macros = {}
         self.confirmed_macros = {
             "RESTART": "RESTART",
@@ -186,9 +188,6 @@ class PanelDue:
             "server:status_update", self.handle_status_update)
         self.server.register_event_handler(
             "server:gcode_response", self.handle_gcode_response)
-
-        self.server.register_remote_method(
-            "paneldue_beep", self.handle_paneldue_beep)
 
         # These commands are directly executued on the server and do not to
         # make a request to Klippy
@@ -247,8 +246,9 @@ class PanelDue:
 
         # Initalize printer state and make subscription request
         self.printer_state = {
-            'gcode': {}, 'toolhead': {}, 'virtual_sdcard': {},
-            'fan': {}, 'display_status': {}, 'print_stats': {}}
+            'gcode_move': {}, 'toolhead': {}, 'virtual_sdcard': {},
+            'fan': {}, 'display_status': {}, 'print_stats': {},
+            'idle_timeout': {}, 'gcode_macro PANELDUE_BEEP': {}}
         sub_args = {k: None for k in self.printer_state.keys()}
         self.extruder_count = 0
         self.heaters = []
@@ -280,13 +280,27 @@ class PanelDue:
         self.is_ready = False
 
     async def handle_status_update(self, status):
-        self.printer_state.update(status)
+        for obj, items in status.items():
+            if obj in self.printer_state:
+                self.printer_state[obj].update(items)
+            else:
+                self.printer_state[obj] = items
+        if "gcode_macro PANELDUE_BEEP" in status:
+            # This only processes a paneldue beep when the macro's
+            # variables have changed
+            params = self.printer_state["gcode_macro PANELDUE_BEEP"]
+            try:
+                self.handle_paneldue_beep(**params)
+            except Exception:
+                logging.exception("Unable to process PANELDUE_BEEP")
 
-    def handle_paneldue_beep(self, frequency, duration):
-        duration = int(duration * 1000.)
-        self.ioloop.spawn_callback(
-            self.write_response,
-            {'beep_freq': frequency, 'beep_length': duration})
+    def handle_paneldue_beep(self, sequence, frequency, duration):
+        if sequence != self.beep_sequence:
+            self.beep_sequence = sequence
+            duration = int(duration * 1000.)
+            self.ioloop.spawn_callback(
+                self.write_response,
+                {'beep_freq': frequency, 'beep_length': duration})
 
     async def process_line(self, line):
         # If we find M112 in the line then skip verification
@@ -458,8 +472,8 @@ class PanelDue:
             return 'S'
 
         printer_state = self.printer_state
-        th_busy = printer_state['toolhead'].get(
-            'status', 'Ready') == "Printing"
+        p_busy = printer_state['idle_timeout'].get(
+            'state', 'Idle') == "Printing"
         sd_state = printer_state['print_stats'].get('state', "standby")
         if sd_state == "printing":
             if self.last_printer_state == 'A':
@@ -468,14 +482,14 @@ class PanelDue:
             # Printing
             return 'P'
         elif sd_state == "paused":
-            if th_busy and self.last_printer_state != 'A':
+            if p_busy and self.last_printer_state != 'A':
                 # Pausing
                 return 'D'
             else:
                 # Paused
                 return 'A'
 
-        if th_busy:
+        if p_busy:
             # Printer is "busy"
             return 'B'
 
@@ -510,15 +524,15 @@ class PanelDue:
         p_state = self.printer_state
         self.last_printer_state = self._get_printer_status()
         response['status'] = self.last_printer_state
-        response['babystep'] = round(p_state['gcode'].get(
-            'homing_zpos', 0.), 3)
+        response['babystep'] = round(p_state['gcode_move'].get(
+            'homing_origin', [0., 0., 0., 0.])[2], 3)
 
         # Current position
         pos = p_state['toolhead'].get('position', [0., 0., 0., 0.])
         response['pos'] = [round(p, 2) for p in pos[:3]]
         homed_pos = p_state['toolhead'].get('homed_axes', "")
         response['homed'] = [int(a in homed_pos) for a in "xyz"]
-        sfactor = round(p_state['gcode'].get('speed_factor', 1.) * 100, 2)
+        sfactor = round(p_state['gcode_move'].get('speed_factor', 1.) * 100, 2)
         response['sfactor'] = sfactor
 
         # Print Progress Tracking
@@ -548,7 +562,8 @@ class PanelDue:
                     # object height estimate
                     obj_height = self.file_metadata.get('object_height')
                     if obj_height:
-                        cur_height = p_state['gcode'].get('move_zpos', 0.)
+                        cur_height = p_state['gcode_move'].get(
+                            'gcode_position', [0., 0., 0., 0.])[2]
                         hpct = min(1., cur_height / obj_height)
                         times_left.append(int(est_time - est_time * hpct))
                 else:
@@ -575,7 +590,8 @@ class PanelDue:
                 response['tool'] = tool
 
         # Report Heater Status
-        efactor = round(p_state['gcode'].get('extrude_factor', 1.) * 100., 2)
+        efactor = round(p_state['gcode_move'].get(
+            'extrude_factor', 1.) * 100., 2)
 
         for name in self.heaters:
             temp = round(p_state[name].get('temperature', 0.0), 1)
