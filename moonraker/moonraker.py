@@ -13,14 +13,16 @@ import logging
 import json
 import confighelper
 import utils
-from tornado import gen, iostream
-from tornado.ioloop import IOLoop, PeriodicCallback
+from tornado import iostream
+from tornado.ioloop import IOLoop
 from tornado.util import TimeoutError
 from tornado.locks import Event
 from app import MoonrakerApp
 from utils import ServerError
 
-INIT_MS = 1000
+INIT_TIME = .25
+LOG_ATTEMPT_INTERVAL = int(2. / INIT_TIME + .5)
+MAX_LOG_ATTEMPTS = 10 * LOG_ATTEMPT_INTERVAL
 
 CORE_PLUGINS = [
     'file_manager', 'klippy_apis', 'machine',
@@ -45,6 +47,7 @@ class Server:
         self.klippy_connection = KlippyConnection(
             self.process_command, self.on_connection_closed)
         self.init_list = []
+        self.init_attempts = 0
         self.klippy_state = "disconnected"
 
         # XXX - currently moonraker maintains a superset of all
@@ -62,7 +65,6 @@ class Server:
         self.register_static_file_handler = app.register_static_file_handler
         self.register_upload_handler = app.register_upload_handler
         self.ioloop = IOLoop.current()
-        self.init_cb = PeriodicCallback(self._initialize, INIT_MS)
 
         # Setup remote methods accessable to Klippy.  Note that all
         # registered remote methods should be of the notification type,
@@ -149,10 +151,10 @@ class Server:
     async def _connect_klippy(self):
         ret = await self.klippy_connection.connect(self.klippy_address)
         if not ret:
-            self.ioloop.call_later(1., self._connect_klippy)
+            self.ioloop.call_later(.25, self._connect_klippy)
             return
         # begin server iniialization
-        self.init_cb.start()
+        self.ioloop.spawn_callback(self._initialize)
 
     def process_command(self, cmd):
         method = cmd.get('method', None)
@@ -185,13 +187,12 @@ class Server:
     def on_connection_closed(self):
         self.init_list = []
         self.klippy_state = "disconnected"
-        self.init_cb.stop()
         for request in self.pending_requests.values():
             request.notify(ServerError("Klippy Disconnected", 503))
         self.pending_requests = {}
         logging.info("Klippy Connection Removed")
         self.send_event("server:klippy_disconnect")
-        self.ioloop.call_later(1., self._connect_klippy)
+        self.ioloop.call_later(.25, self._connect_klippy)
 
     async def _initialize(self):
         await self._check_ready()
@@ -220,7 +221,10 @@ class Server:
             # Moonraker is enabled in the Klippy module
             # and Klippy is ready.  We can stop the init
             # procedure.
-            self.init_cb.stop()
+            self.init_attempts = 0
+        else:
+            self.init_attempts += 1
+            self.ioloop.call_later(INIT_TIME, self._initialize)
 
     async def _request_endpoints(self):
         result = await self.klippy_apis.list_endpoints(default=None)
@@ -235,10 +239,12 @@ class Server:
         try:
             result = await self.klippy_apis.get_klippy_info(send_id)
         except ServerError as e:
-            logging.info(
-                f"{e}\nKlippy info request error.  This indicates that\n"
-                f"Klippy may have experienced an error during startup.\n"
-                f"Please check klippy.log for more information")
+            if self.init_attempts % LOG_ATTEMPT_INTERVAL == 0 and \
+                    self.init_attempts <= MAX_LOG_ATTEMPTS:
+                logging.info(
+                    f"{e}\nKlippy info request error.  This indicates that\n"
+                    f"Klippy may have experienced an error during startup.\n"
+                    f"Please check klippy.log for more information")
             return
         if send_id:
             self.init_list.append("identified")
@@ -255,7 +261,8 @@ class Server:
             self.klippy_state = "ready"
             self.init_list.append('klippy_ready')
             self.send_event("server:klippy_ready")
-        else:
+        elif self.init_attempts % LOG_ATTEMPT_INTERVAL == 0 and \
+                self.init_attempts <= MAX_LOG_ATTEMPTS:
             msg = result.get('state_message', "Klippy Not Ready")
             logging.info("\n" + msg)
 
@@ -454,13 +461,14 @@ def main():
     # Setup Logging
     log_file = os.path.normpath(os.path.expanduser(cmd_line_args.logfile))
     cmd_line_args.logfile = log_file
-    utils.setup_logging(log_file)
+    ql = utils.setup_logging(log_file)
 
     if sys.version_info < (3, 7):
         msg = f"Moonraker requires Python 3.7 or above.  " \
             f"Detected Version: {sys.version}"
         logging.info(msg)
         print(msg)
+        ql.stop()
         exit(1)
 
     # Start IOLoop and Server
@@ -469,6 +477,7 @@ def main():
         server = Server(cmd_line_args)
     except Exception:
         logging.exception("Moonraker Error")
+        ql.stop()
         exit(1)
     try:
         server.start()
@@ -477,6 +486,7 @@ def main():
         logging.exception("Server Running Error")
     io_loop.close(True)
     logging.info("Server Shutdown")
+    ql.stop()
 
 
 if __name__ == '__main__':
