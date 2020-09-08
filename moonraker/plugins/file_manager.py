@@ -37,6 +37,9 @@ class FileManager:
             "/server/files/move", ['POST'], self._handle_file_move_copy)
         self.server.register_endpoint(
             "/server/files/copy", ['POST'], self._handle_file_move_copy)
+        self.server.register_endpoint(
+            "/server/files/delete_file", ['DELETE'], self._handle_file_delete,
+            protocol=["websocket"])
         # Register APIs to handle file uploads
         self.server.register_upload_handler("/server/files/upload")
         self.server.register_upload_handler("/api/files/local")
@@ -44,8 +47,7 @@ class FileManager:
         # Register Klippy Configuration Path
         config_path = config.get('config_path', None)
         if config_path is not None:
-            ret = self.register_directory(
-                'config', config_path, can_delete=True)
+            ret = self.register_directory('config', config_path)
             if not ret:
                 raise config.error(
                     "Option 'config_path' is not a valid directory")
@@ -69,10 +71,7 @@ class FileManager:
         log_path = os.path.normpath(os.path.expanduser(log_file))
         self.server.register_static_file_handler("klippy.log", log_path)
 
-    def register_directory(self, base, path, can_delete=False):
-        op_check_cb = None
-        if base == 'gcodes':
-            op_check_cb = self._handle_operation_check
+    def register_directory(self, base, path):
         if path is None:
             return False
         home = os.path.expanduser('~')
@@ -86,8 +85,7 @@ class FileManager:
             return False
         if path != self.file_paths.get(base, ""):
             self.file_paths[base] = path
-            self.server.register_static_file_handler(
-                base, path, can_delete=can_delete, op_check_cb=op_check_cb)
+            self.server.register_static_file_handler(base, path)
             try:
                 self._update_file_list(base=base)
             except Exception:
@@ -441,16 +439,33 @@ class FileManager:
             return simple_list
         return flist
 
-    def delete_file(self, path):
-        parts = path.split("/", 1)
+    async def _handle_file_delete(self, path, method, args):
+        file_path = args.get("path")
+        return await self.delete_file(file_path)
+
+    async def delete_file(self, path):
+        parts = path.lstrip("/").split("/", 1)
+        if len(parts) != 2:
+            raise self.server.error(
+                f"Path not available for DELETE: {path}", 405)
         root = parts[0]
-        if root not in self.file_paths or len(parts) != 2:
-            raise self.server.error(f"Invalid file path: {path}")
+        filename = parts[1]
+        if root not in self.file_paths or root not in FULL_ACCESS_ROOTS:
+            raise self.server.error(
+                f"Path not available for DELETE: {path}", 405)
         root_path = self.file_paths[root]
-        full_path = os.path.join(root_path, parts[1])
+        full_path = os.path.join(root_path, filename)
         if not os.path.isfile(full_path):
             raise self.server.error(f"Invalid file path: {path}")
+        if root == "gcodes":
+            try:
+                await self._handle_operation_check(full_path)
+            except self.server.error as e:
+                if e.status_code == 403:
+                    raise
         os.remove(full_path)
+        self.notify_filelist_changed('delete_file', filename, root)
+        return filename
 
     def notify_filelist_changed(self, action, fname, base, source_item={}):
         self._update_file_list(base, do_notify=True)

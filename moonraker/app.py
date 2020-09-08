@@ -9,6 +9,7 @@ import mimetypes
 import logging
 import tornado
 from inspect import isclass
+from tornado.escape import url_unescape
 from tornado.routing import Rule, PathMatches, AnyMatches
 from utils import ServerError
 from websockets import WebsocketManager, WebSocket
@@ -165,28 +166,28 @@ class MoonrakerApp:
         self.registered_base_handlers.append(api_def.uri)
 
     def register_local_handler(self, uri, request_methods,
-                               callback, http_only=False):
+                               callback, protocol=["http", "websocket"]):
         if uri in self.registered_base_handlers:
             return
         api_def = self._create_api_definition(
             uri, request_methods, is_remote=False)
-        msg = "Registering local endpoint - "
-        msg += f"HTTP: ({' '.join(request_methods)}) {uri}"
-        if not http_only:
-            msg += f"; Websocket: {', '.join(api_def.ws_methods)}"
+        msg = "Registering local endpoint"
+        if "http" in protocol:
+            msg += f" - HTTP: ({' '.join(request_methods)}) {uri}"
+            params = {}
+            params['server'] = self.server
+            params['auth'] = self.auth
+            params['methods'] = request_methods
+            params['arg_parser'] = api_def.parser
+            params['callback'] = callback
+            self.mutable_router.add_handler(uri, LocalRequestHandler, params)
+            self.registered_base_handlers.append(uri)
+        if "websocket" in protocol:
+            msg += f" - Websocket: {', '.join(api_def.ws_methods)}"
             self.wsm.register_local_handler(api_def, callback)
         logging.info(msg)
-        params = {}
-        params['server'] = self.server
-        params['auth'] = self.auth
-        params['methods'] = request_methods
-        params['arg_parser'] = api_def.parser
-        params['callback'] = callback
-        self.mutable_router.add_handler(uri, LocalRequestHandler, params)
-        self.registered_base_handlers.append(uri)
 
-    def register_static_file_handler(self, pattern, file_path,
-                                     can_delete=False, op_check_cb=None):
+    def register_static_file_handler(self, pattern, file_path):
         if pattern[0] != "/":
             pattern = "/server/files/" + pattern
         if os.path.isfile(file_path):
@@ -199,12 +200,7 @@ class MoonrakerApp:
             logging.info(f"Invalid file path: {file_path}")
             return
         logging.debug(f"Registering static file: ({pattern}) {file_path}")
-        methods = ['GET']
-        if can_delete:
-            methods.append('DELETE')
-        params = {
-            'server': self.server, 'auth': self.auth,
-            'path': file_path, 'methods': methods, 'op_check_cb': op_check_cb}
+        params = {'server': self.server, 'auth': self.auth, 'path': file_path}
         self.mutable_router.add_handler(pattern, FileRequestHandler, params)
 
     def register_upload_handler(self, pattern):
@@ -320,13 +316,6 @@ class LocalRequestHandler(AuthorizedRequestHandler):
 
 
 class FileRequestHandler(AuthorizedFileHandler):
-    def initialize(self, server, auth, path, methods,
-                   op_check_cb=None, default_filename=None):
-        super(FileRequestHandler, self).initialize(
-            server, auth, path, default_filename)
-        self.methods = methods
-        self.op_check_cb = op_check_cb
-
     def set_extra_headers(self, path):
         # The call below shold never return an empty string,
         # as the path should have already been validated to be
@@ -336,29 +325,17 @@ class FileRequestHandler(AuthorizedFileHandler):
             "Content-Disposition", f"attachment; filename={basename}")
 
     async def delete(self, path):
-        if 'DELETE' not in self.methods:
-            raise tornado.web.HTTPError(405)
-
-        # Use the same method Tornado uses to validate the path
-        self.path = self.parse_url_path(path)
-        del path  # make sure we don't refer to path instead of self.path again
-        absolute_path = self.get_absolute_path(self.root, self.path)
-        self.absolute_path = self.validate_absolute_path(
-            self.root, absolute_path)
-
-        if self.op_check_cb is not None:
-            try:
-                await self.op_check_cb(self.absolute_path)
-            except ServerError as e:
-                if e.status_code == 403:
-                    raise tornado.web.HTTPError(
-                        403, "File is loaded, DELETE not permitted")
-
-        os.remove(self.absolute_path)
-        base = self.request.path.lstrip("/").split("/")[2]
-        filename = self.path.lstrip("/")
+        path = self.request.path.lstrip("/").split("/", 2)[-1]
+        path = url_unescape(path)
         file_manager = self.server.lookup_plugin('file_manager')
-        file_manager.notify_filelist_changed('delete_file', filename, base)
+        try:
+            filename = await file_manager.delete_file(path)
+        except self.server.error as e:
+            if e.status_code == 403:
+                raise tornado.web.HTTPError(
+                    403, "File is loaded, DELETE not permitted")
+            else:
+                raise tornado.web.HTTPError(e.status_code, str(e))
         self.finish({'result': filename})
 
 class FileUploadHandler(AuthorizedRequestHandler):
