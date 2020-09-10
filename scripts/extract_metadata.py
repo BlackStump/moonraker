@@ -38,11 +38,19 @@ def _regex_find_ints(pattern, data):
             pass
     return []
 
+def _regex_find_first(pattern, data, cast=float):
+    match = re.search(pattern, data)
+    val = None
+    if match:
+        try:
+            val = cast(match.group(1))
+        except Exception:
+            return None
+    return val
+
 # Slicer parsing implementations
 class BaseSlicer(object):
-    def __init__(self, name, id_pattern):
-        self.name = name
-        self.id_pattern = id_pattern
+    def __init__(self):
         self.header_data = self.footer_data = self.log = None
 
     def set_data(self, header_data, footer_data, log):
@@ -50,57 +58,106 @@ class BaseSlicer(object):
         self.footer_data = footer_data
         self.log = log
 
-    def get_name(self):
-        return self.name
-
-    def get_id_pattern(self):
-        return self.id_pattern
-
-    def _parse_min_float(self, pattern, data):
-        result = _regex_find_floats(pattern, data)
+    def _parse_min_float(self, pattern, data, strict=False):
+        result = _regex_find_floats(pattern, data, strict)
         if result:
             return min(result)
         else:
             return None
 
-    def _parse_max_float(self, pattern, data):
-        result = _regex_find_floats(pattern, data)
+    def _parse_max_float(self, pattern, data, strict=False):
+        result = _regex_find_floats(pattern, data, strict)
         if result:
             return max(result)
         else:
             return None
 
-class PrusaSlicer(BaseSlicer):
-    def __init__(self, name="PrusaSlicer", id_pattern=r"PrusaSlicer\s.*\son"):
-        super(PrusaSlicer, self).__init__(name, id_pattern)
+    def check_identity(self, data):
+        return None
 
     def parse_first_layer_height(self):
-        return self._parse_min_float(
-            r"; first_layer_height =.*", self.footer_data)
+        return None
 
     def parse_layer_height(self):
-        return self._parse_min_float(r"; layer_height =.*", self.footer_data)
+        return None
+
+    def parse_object_height(self):
+        return None
+
+    def parse_filament_total(self):
+        return None
+
+    def parse_estimated_time(self):
+        return None
+
+    def parse_first_layer_bed_temp(self):
+        return None
+
+    def parse_first_layer_extr_temp(self):
+        return None
+
+    def parse_thumbnails(self):
+        return None
+
+class UnknownSlicer(BaseSlicer):
+    def check_identity(self, data):
+        return {'slicer': "Unknown"}
+
+    def parse_first_layer_height(self):
+        return self._parse_min_float(r"G1\sZ\d+\.\d*", self.header_data)
+
+    def parse_object_height(self):
+        return self._parse_max_float(r"G1\sZ\d+\.\d*", self.footer_data)
+
+    def parse_first_layer_extr_temp(self):
+        return _regex_find_first(
+            r"M109 S(\d+\.?\d*)", self.header_data)
+
+    def parse_first_layer_bed_temp(self):
+        return _regex_find_first(
+            r"M190 S(\d+\.?\d*)", self.header_data)
+
+class PrusaSlicer(BaseSlicer):
+    def check_identity(self, data):
+        match = re.search(r"PrusaSlicer\s(.*)\son", data)
+        if match:
+            return {
+                'slicer': "PrusaSlicer",
+                'slicer_version': match.group(1)
+            }
+        return None
+
+    def parse_first_layer_height(self):
+        return _regex_find_first(
+            r"; first_layer_height = (\d+\.?\d*)", self.footer_data)
+
+    def parse_layer_height(self):
+        return _regex_find_first(
+            r"; layer_height = (\d+\.?\d*)", self.footer_data)
 
     def parse_object_height(self):
         return self._parse_max_float(r"G1\sZ\d+\.\d*\sF", self.footer_data)
 
     def parse_filament_total(self):
-        return self._parse_max_float(
-            r"filament\sused\s\[mm\]\s=\s\d+\.\d*", self.footer_data)
+        return _regex_find_first(
+            r"filament\sused\s\[mm\]\s=\s(\d+\.\d*)", self.footer_data)
 
     def parse_estimated_time(self):
-        time_matches = re.findall(
+        time_match = re.search(
             r';\sestimated\sprinting\stime.*', self.footer_data)
-        if not time_matches:
+        if not time_match:
             return None
         total_time = 0
-        time_match = time_matches[0]
-        time_patterns = [(r"\d+d", 24*60*60), (r"\d+h", 60*60),
-                         (r"\d+m", 60), (r"\d+s", 1)]
-        for pattern, multiplier in time_patterns:
-            t = _regex_find_ints(pattern, time_match)
-            if t:
-                total_time += max(t) * multiplier
+        time_match = time_match.group()
+        time_patterns = [(r"(\d+)d", 24*60*60), (r"(\d+)h", 60*60),
+                         (r"(\d+)m", 60), (r"(\d+)s", 1)]
+        try:
+            for pattern, multiplier in time_patterns:
+                t = re.search(pattern, time_match)
+                if t:
+                    total_time += int(t.group(1)) * multiplier
+        except Exception:
+            return None
         return round(total_time, 2)
 
     def parse_thumbnails(self):
@@ -126,48 +183,79 @@ class PrusaSlicer(BaseSlicer):
             parsed_matches.append({
                 'width': info[0], 'height': info[1],
                 'size': info[2], 'data': data})
-
         return parsed_matches
 
+    def parse_first_layer_extr_temp(self):
+        return _regex_find_first(
+            r"; first_layer_temperature = (\d+\.?\d*)", self.footer_data)
+
+    def parse_first_layer_bed_temp(self):
+        return _regex_find_first(
+            r"; first_layer_bed_temperature = (\d+\.?\d*)", self.footer_data)
+
 class Slic3rPE(PrusaSlicer):
-    def __init__(self, name="Slic3r PE",
-                 id_pattern=r"Slic3r\sPrusa\sEdition\s.*\son"):
-        super(Slic3rPE, self).__init__(name, id_pattern)
+    def check_identity(self, data):
+        match = re.search(r"Slic3r\sPrusa\sEdition\s(.*)\son", data)
+        if match:
+            return {
+                'slicer': "Slic3r PE",
+                'slicer_version': match.group(1)
+            }
+        return None
 
     def parse_filament_total(self):
-        return self._parse_max_float(
-            r"filament\sused\s=\s\d+\.\d+mm", self.footer_data)
+        return _regex_find_first(
+            r"filament\sused\s=\s(\d+\.\d+)mm", self.footer_data)
 
     def parse_thumbnails(self):
         return None
 
 class Slic3r(Slic3rPE):
-    def __init__(self, name="Slic3r", id_pattern=r"Slic3r\s\d.*\son"):
-        super(Slic3r, self).__init__(name, id_pattern)
+    def check_identity(self, data):
+        match = re.search(r"Slic3r\s(\d.*)\son", data)
+        if match:
+            return {
+                'slicer': "Slic3r",
+                'slicer_version': match.group(1)
+            }
+        return None
 
     def parse_estimated_time(self):
         return None
 
 class SuperSlicer(PrusaSlicer):
-    def __init__(self, name="SuperSlicer", id_pattern=r"SuperSlicer\s.*\son"):
-        super(SuperSlicer, self).__init__(name, id_pattern)
+    def check_identity(self, data):
+        match = re.search(r"SuperSlicer\s(.*)\son", data)
+        if match:
+            return {
+                'slicer': "SuperSlicer",
+                'slicer_version': match.group(1)
+            }
+        return None
 
 class Cura(BaseSlicer):
-    def __init__(self, name="Cura", id_pattern=r"Cura_SteamEngine.*"):
-        super(Cura, self).__init__(name, id_pattern)
+    def check_identity(self, data):
+        match = re.search(r"Cura_SteamEngine\s(.*)", data)
+        if match:
+            return {
+                'slicer': "Cura",
+                'slicer_version': match.group(1)
+            }
+        return None
 
     def parse_first_layer_height(self):
-        return self._parse_min_float(r";MINZ:.*", self.header_data)
+        return _regex_find_first(r";MINZ:(\d+\.?\d*)", self.header_data)
 
     def parse_layer_height(self):
-        return self._parse_min_float(r";Layer\sheight:.*", self.header_data)
+        return _regex_find_first(
+            r";Layer\sheight:\s(\d+\.?\d*)", self.header_data)
 
     def parse_object_height(self):
-        return self._parse_max_float(r";MAXZ:.*", self.header_data)
+        return _regex_find_first(r";MAXZ:(\d+\.?\d*)", self.header_data)
 
     def parse_filament_total(self):
-        filament = self._parse_max_float(
-            r";Filament\sused:.*", self.header_data)
+        filament = _regex_find_first(
+            r";Filament\sused:\s(\d+\.?\d*)m", self.header_data)
         if filament is not None:
             filament *= 1000
         return filament
@@ -175,55 +263,99 @@ class Cura(BaseSlicer):
     def parse_estimated_time(self):
         return self._parse_max_float(r";TIME:.*", self.header_data)
 
-    def parse_thumbnails(self):
-        return None
+    def parse_first_layer_extr_temp(self):
+        return _regex_find_first(
+            r"M109 S(\d+\.?\d*)", self.header_data)
+
+    def parse_first_layer_bed_temp(self):
+        return _regex_find_first(
+            r"M190 S(\d+\.?\d*)", self.header_data)
+
 
 class Simplify3D(BaseSlicer):
-    def __init__(self, name="Simplify3D", id_pattern=r"Simplify3D\(R\)"):
-        super(Simplify3D, self).__init__(name, id_pattern)
+    def check_identity(self, data):
+        match = re.search(r"Simplify3D\(R\)\sVersion\s(.*)", data)
+        if match:
+            return {
+                'slicer': "Simplify3D",
+                'slicer_version': match.group(1)
+            }
+        return None
 
     def parse_first_layer_height(self):
         return self._parse_min_float(r"G1\sZ\d+\.\d*", self.header_data)
 
     def parse_layer_height(self):
-        return self._parse_min_float(r";\s+layerHeight,.*", self.header_data)
+        return _regex_find_first(
+            r";\s+layerHeight,(\d+\.?\d*)", self.header_data)
 
     def parse_object_height(self):
         return self._parse_max_float(r"G1\sZ\d+\.\d*", self.footer_data)
 
     def parse_filament_total(self):
-        return self._parse_max_float(
-            r";\s+Filament\slength:.*mm", self.footer_data)
+        return _regex_find_first(
+            r";\s+Filament\slength:\s(\d+\.?\d*)\smm", self.footer_data)
 
     def parse_estimated_time(self):
-        time_matches = re.findall(
+        time_match = re.search(
             r';\s+Build time:.*', self.footer_data)
-        if not time_matches:
+        if not time_match:
             return None
         total_time = 0
-        time_match = time_matches[0]
-        time_patterns = [(r"\d+\shours", 60*60), (r"\d+\smin", 60),
-                         (r"\d+\ssec", 1)]
-        for pattern, multiplier in time_patterns:
-            t = _regex_find_ints(pattern, time_match)
-            if t:
-                total_time += max(t) * multiplier
+        time_match = time_match.group()
+        time_patterns = [(r"(\d+)\shours", 60*60), (r"(\d+)\smin", 60),
+                         (r"(\d+)\ssec", 1)]
+        try:
+            for pattern, multiplier in time_patterns:
+                t = re.search(pattern, time_match)
+                if t:
+                    total_time += int(t.group(1)) * multiplier
+        except Exception:
+            return None
         return round(total_time, 2)
 
-    def parse_thumbnails(self):
+    def _get_temp_items(self, pattern):
+        match = re.search(pattern, self.header_data)
+        if match is None:
+            return []
+        return match.group().split(",")[1:]
+
+    def _get_first_layer_temp(self, heater):
+        heaters = self._get_temp_items(r"temperatureName.*")
+        temps = self._get_temp_items(r"temperatureSetpointTemperatures.*")
+        for h, temp in zip(heaters, temps):
+            if h == heater:
+                try:
+                    return float(temp)
+                except Exception:
+                    return None
         return None
 
+    def parse_first_layer_extr_temp(self):
+        return self._get_first_layer_temp("Extruder 1")
+
+    def parse_first_layer_bed_temp(self):
+        return self._get_first_layer_temp("Heated Bed")
+
 class KISSlicer(BaseSlicer):
-    def __init__(self, name="KISSlicer", id_pattern=r";\sKISSlicer"):
-        super(KISSlicer, self).__init__(name, id_pattern)
+    def check_identity(self, data):
+        match = re.search(r";\sKISSlicer", data)
+        if match:
+            ident = {'slicer': "KISSlicer"}
+            vmatch = re.search(r";\sversion\s(.*)", data)
+            if vmatch:
+                version = vmatch.group(1).replace(" ", "-")
+                ident['slicer_version'] = version
+            return ident
+        return None
 
     def parse_first_layer_height(self):
-        return self._parse_min_float(
-            r";\s+first_layer_thickness_mm\s=\s\d.*", self.header_data)
+        return _regex_find_first(
+            r";\s+first_layer_thickness_mm\s=\s(\d+\.?\d*)", self.header_data)
 
     def parse_layer_height(self):
-        return self._parse_min_float(
-            r";\s+max_layer_thickness_mm\s=\s\d.*", self.header_data)
+        return _regex_find_first(
+            r";\s+max_layer_thickness_mm\s=\s(\d+\.?\d*)", self.header_data)
 
     def parse_object_height(self):
         return self._parse_max_float(
@@ -237,18 +369,32 @@ class KISSlicer(BaseSlicer):
         return None
 
     def parse_estimated_time(self):
-        time = self._parse_max_float(
-            r";\sCalculated.*Build\sTime:.*", self.footer_data)
+        time = _regex_find_first(
+            r";\sCalculated.*Build\sTime:\s(\d+\.?\d*)\sminutes",
+            self.footer_data)
         if time is not None:
             time *= 60
-        return round(time, 2)
-
-    def parse_thumbnails(self):
+            return round(time, 2)
         return None
 
+    def parse_first_layer_extr_temp(self):
+        return _regex_find_first(
+            r"; first_layer_C = (\d+\.?\d*)", self.header_data)
+
+    def parse_first_layer_bed_temp(self):
+        return _regex_find_first(
+            r"; bed_C = (\d+\.?\d*)", self.header_data)
+
+
 class IdeaMaker(BaseSlicer):
-    def __init__(self, name="IdeaMaker", id_pattern=r"\sideaMaker\s.*,",):
-        super(IdeaMaker, self).__init__(name, id_pattern)
+    def check_identity(self, data):
+        match = re.search(r"\sideaMaker\s(.*),", data)
+        if match:
+            return {
+                'slicer': "IdeaMaker",
+                'slicer_version': match.group(1)
+            }
+        return None
 
     def parse_first_layer_height(self):
         layer_info = _regex_find_floats(
@@ -266,7 +412,7 @@ class IdeaMaker(BaseSlicer):
 
     def parse_object_height(self):
         bounds = _regex_find_floats(
-            r";Bounding Box:.*", self.footer_data)
+            r";Bounding Box:.*", self.header_data)
         if len(bounds) >= 6:
             return bounds[5]
         return None
@@ -279,19 +425,55 @@ class IdeaMaker(BaseSlicer):
         return None
 
     def parse_estimated_time(self):
-        return self._parse_max_float(r";Print\sTime:.*", self.footer_data)
+        return _regex_find_first(
+            r";Print\sTime:\s(\d+\.?\d*)", self.footer_data)
 
-    def parse_thumbnails(self):
+    def parse_first_layer_extr_temp(self):
+        return _regex_find_first(
+            r"M109 T0 S(\d+\.?\d*)", self.header_data)
+
+    def parse_first_layer_bed_temp(self):
+        return _regex_find_first(
+            r"M190 S(\d+\.?\d*)", self.header_data)
+
+class IceSL(BaseSlicer):
+    def check_identity(self, data):
+        match = re.search(r"; <IceSL.*>", data)
+        if match:
+            return {'slicer': "IceSL"}
         return None
+
+    def parse_first_layer_height(self):
+        return _regex_find_first(
+            r"; z_layer_height_first_layer_mm :\s+(\d+\.\d+)",
+            self.header_data, float)
+
+    def parse_layer_height(self):
+        return _regex_find_first(
+            r"; z_layer_height_mm :\s+(\d+\.\d+)",
+            self.header_data, float)
+
+    def parse_object_height(self):
+        return self._parse_max_float(
+            r"G0 F\d+ Z\d+\.\d+", self.footer_data, strict=True)
+
+    def parse_first_layer_extr_temp(self):
+        return _regex_find_first(
+            r"; extruder_temp_degree_c_0 :\s+(\d+\.?\d*)", self.header_data)
+
+    def parse_first_layer_bed_temp(self):
+        return _regex_find_first(
+            r"; bed_temp_degree_c :\s+(\d+\.?\d*)", self.header_data)
 
 
 READ_SIZE = 512 * 1024
 SUPPORTED_SLICERS = [
     PrusaSlicer, Slic3rPE, Slic3r, SuperSlicer,
-    Cura, Simplify3D, KISSlicer, IdeaMaker]
+    Cura, Simplify3D, KISSlicer, IdeaMaker, IceSL]
 SUPPORTED_DATA = [
     'first_layer_height', 'layer_height', 'object_height',
-    'filament_total', 'estimated_time', 'thumbnails']
+    'filament_total', 'estimated_time', 'thumbnails',
+    'first_layer_bed_temp', 'first_layer_extr_temp']
 
 def extract_metadata(file_path, log):
     metadata = {}
@@ -305,27 +487,28 @@ def extract_metadata(file_path, log):
         # identify the slicer
         header_data = f.read(READ_SIZE)
         for s in slicers:
-            if re.search(s.get_id_pattern(), header_data) is not None:
+            ident = s.check_identity(header_data)
+            if ident is not None:
                 slicer = s
+                metadata.update(ident)
                 break
-        if slicer is not None:
-            metadata['slicer'] = slicer.get_name()
-            if size > READ_SIZE * 2:
-                f.seek(size - READ_SIZE)
-                footer_data = f.read()
-            elif size > READ_SIZE:
-                remaining = size - READ_SIZE
-                footer_data = header_data[remaining - READ_SIZE:] + f.read()
-            else:
-                footer_data = header_data
-            slicer.set_data(header_data, footer_data, log)
-            for key in SUPPORTED_DATA:
-                func = getattr(slicer, "parse_" + key)
-                result = func()
-                if result is not None:
-                    metadata[key] = result
-        else:
+        if slicer is None:
+            slicer = UnknownSlicer()
             metadata['slicer'] = "Unknown"
+        if size > READ_SIZE * 2:
+            f.seek(size - READ_SIZE)
+            footer_data = f.read()
+        elif size > READ_SIZE:
+            remaining = size - READ_SIZE
+            footer_data = header_data[remaining - READ_SIZE:] + f.read()
+        else:
+            footer_data = header_data
+        slicer.set_data(header_data, footer_data, log)
+        for key in SUPPORTED_DATA:
+            func = getattr(slicer, "parse_" + key)
+            result = func()
+            if result is not None:
+                metadata[key] = result
     return metadata
 
 def main(path, filename):
