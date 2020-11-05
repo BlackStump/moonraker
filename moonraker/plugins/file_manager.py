@@ -13,7 +13,7 @@ import json
 from tornado.ioloop import IOLoop
 from tornado.locks import Lock
 
-VALID_GCODE_EXTS = ['gcode', 'g', 'gco']
+VALID_GCODE_EXTS = ['.gcode', '.g', '.gco']
 FULL_ACCESS_ROOTS = ["gcodes", "config"]
 METADATA_SCRIPT = os.path.join(
     os.path.dirname(__file__), "../../scripts/extract_metadata.py")
@@ -106,8 +106,8 @@ class FileManager:
 
     async def _handle_metadata_request(self, path, method, args):
         requested_file = args.get('filename')
-        metadata = self.gcode_metadata.get(requested_file)
-        if metadata is None:
+        metadata = dict(self.gcode_metadata.get(requested_file, {}))
+        if not metadata:
             raise self.server.error(
                 f"Metadata not available for <{requested_file}>", 404)
         metadata['filename'] = requested_file
@@ -118,20 +118,34 @@ class FileManager:
         base, url_path, dir_path = self._convert_path(directory)
         method = method.upper()
         if method == 'GET':
+            need_update = False
+            is_extended = args.get('extended', False)
+            if isinstance(is_extended, str):
+                val = is_extended.lower()
+                if val in ["true", "false"]:
+                    is_extended = True if val == "true" else False
+            if not isinstance(is_extended, bool):
+                raise self.server.error(
+                    f"Invalid argument for 'extended': {is_extended}")
             # Get list of files and subdirectories for this target
             dir_info = self._list_directory(dir_path)
             # Check to see if a filelist update is necessary
             for f in dir_info['files']:
                 fname = os.path.join(url_path, f['filename'])
-                ext = f['filename'][f['filename'].rfind('.')+1:]
+                ext = os.path.splitext(f['filename'])[-1].lower()
                 if base == 'gcodes' and ext not in VALID_GCODE_EXTS:
                     continue
-                finfo = self.file_lists[base].get(fname, None)
-                if finfo is None or f['modified'] != finfo['modified']:
+                metadata = self.gcode_metadata.get(fname, None)
+                if metadata is None or f['modified'] != metadata['modified']:
                     # Either a new file found or file has changed, update
                     # internal file list
-                    self._update_file_list(base, do_notify=True)
-                    break
+                    need_update = True
+                    if not is_extended:
+                        break
+                elif is_extended:
+                    f.update(metadata)
+            if need_update:
+                self._update_file_list(base, do_notify=True)
             return dir_info
         elif method == 'POST' and base in FULL_ACCESS_ROOTS:
             # Create a new directory
@@ -283,7 +297,7 @@ class FileManager:
         new_list = {}
         for root, dirs, files in os.walk(path, followlinks=True):
             for name in files:
-                ext = name[name.rfind('.')+1:]
+                ext = os.path.splitext(name)[-1].lower()
                 if base == 'gcodes' and ext not in VALID_GCODE_EXTS:
                     continue
                 full_path = os.path.join(root, name)
@@ -466,7 +480,7 @@ class FileManager:
             filename = filename[7:]
 
         flist = self.get_file_list()
-        return self.gcode_metadata.get(filename, flist.get(filename, {}))
+        return dict(self.gcode_metadata.get(filename, flist.get(filename, {})))
 
     def list_dir(self, directory, simple_format=False):
         # List a directory relative to its root.  Currently the only
@@ -493,7 +507,7 @@ class FileManager:
                 simple_list.append("*" + dirobj['dirname'])
             for fileobj in flist['files']:
                 fname = fileobj['filename']
-                ext = fname[fname.rfind('.')+1:]
+                ext = os.path.splitext(fname)[-1].lower()
                 if root == "gcodes" and ext in VALID_GCODE_EXTS:
                     simple_list.append(fname)
             return simple_list
