@@ -71,12 +71,13 @@ class Authorization:
             "/access/oneshot_token", ['GET'],
             self._handle_token_request, protocol=['http'])
 
-    async def _handle_apikey_request(self, path, method, args):
-        if method.upper() == 'POST':
+    async def _handle_apikey_request(self, web_request):
+        action = web_request.get_action()
+        if action.upper() == 'POST':
             self.api_key = self._create_api_key()
         return self.api_key
 
-    async def _handle_token_request(self, path, method, args):
+    async def _handle_token_request(self, web_request):
         return self.get_access_token()
 
     def _read_api_key(self):
@@ -179,9 +180,10 @@ class Authorization:
         self.prune_handler.stop()
 
 class AuthorizedRequestHandler(tornado.web.RequestHandler):
-    def initialize(self, server, auth):
-        self.server = server
-        self.auth = auth
+    def initialize(self, main_app):
+        self.server = main_app.get_server()
+        self.auth = main_app.get_auth()
+        self.wsm = main_app.get_websocket_manager()
 
     def prepare(self):
         if not self.auth.check_authorized(self.request):
@@ -206,13 +208,27 @@ class AuthorizedRequestHandler(tornado.web.RequestHandler):
         else:
             super(AuthorizedRequestHandler, self).options()
 
+    def get_associated_websocket(self):
+        # Return associated websocket connection if an id
+        # was provided by the request
+        conn = None
+        conn_id = self.get_argument('connection_id', None)
+        if conn_id is not None:
+            try:
+                conn_id = int(conn_id)
+            except Exception:
+                pass
+            else:
+                conn = self.wsm.get_websocket(conn_id)
+        return conn
+
 # Due to the way Python treats multiple inheritance its best
 # to create a separate authorized handler for serving files
 class AuthorizedFileHandler(tornado.web.StaticFileHandler):
-    def initialize(self, server, auth, path, default_filename=None):
+    def initialize(self, main_app, path, default_filename=None):
         super(AuthorizedFileHandler, self).initialize(path, default_filename)
-        self.server = server
-        self.auth = auth
+        self.server = main_app.get_server()
+        self.auth = main_app.get_auth()
 
     def prepare(self):
         if not self.auth.check_authorized(self.request):
