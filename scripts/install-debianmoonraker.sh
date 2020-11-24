@@ -3,6 +3,7 @@
 # using systemd
 
 PYTHONDIR="${HOME}/moonraker-env"
+REBUILD_ENV="n"
 SYSTEMDDIR="/etc/systemd/system"
 MOONRAKER_USER=$USER
 
@@ -21,7 +22,7 @@ check_klipper()
 # Step 2: Install packages
 install_packages()
 {
-    PKGLIST="python3-virtualenv python3-dev nginx"
+    PKGLIST="python3-virtualenv python3-dev nginx libopenjp2-7 python3-libgpiod"
 
     
     # Install desired packages
@@ -32,10 +33,15 @@ install_packages()
 # Step 3: Create python virtual environment
 create_virtualenv()
 {
-    report_status "Updating python virtual environment..."
+    report_status "Installing python virtual environment..."
 
-    # Create virtualenv if it doesn't already exist
-    [ ! -d ${PYTHONDIR} ] && virtualenv -p /usr/bin/python3 ${PYTHONDIR}
+    # If venv exists and user prompts a rebuild, then do so
+    if [ -d ${PYTHONDIR} ] && [ $REBUILD_ENV = "y" ]; then
+        report_status "Removing old virtualenv"
+        rm -rf ${PYTHONDIR}
+    fi
+
+    [ ! -d ${PYTHONDIR} ] && virtualenv -p /usr/bin/python3 --system-site-packages ${PYTHONDIR}
 
     # Install/update dependencies
     ${PYTHONDIR}/bin/pip install -r ${SRCDIR}/scripts/moonraker-requirements.txt
@@ -97,6 +103,11 @@ set -e
 
 # Find SRCDIR from the pathname of this script
 SRCDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )"/.. && pwd )"
+while getopts "rfc:" arg; do
+    case $arg in
+        r) REBUILD_ENV="y";;
+    esac
+done
 
 # Run installation steps defined above
 verify_ready
