@@ -11,6 +11,7 @@ import sys
 import shutil
 import zipfile
 import io
+import asyncio
 import tornado.gen
 from tornado.ioloop import IOLoop
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
@@ -44,11 +45,10 @@ class UpdateManager:
         self.server = config.get_server()
         AsyncHTTPClient.configure(None, defaults=dict(user_agent="Moonraker"))
         self.http_client = AsyncHTTPClient()
-        sw_version = config['system_args'].get('software_version')
+        env = sys.executable
         self.updaters = {
             "system": PackageUpdater(self),
-            "moonraker": GitUpdater(self, "moonraker", MOONRAKER_PATH,
-                                    sw_version, sys.executable)
+            "moonraker": GitUpdater(self, "moonraker", MOONRAKER_PATH, env)
         }
         self.current_update = None
         client_repo = config.get("client_repo", None)
@@ -86,14 +86,14 @@ class UpdateManager:
             logging.info("No valid klippy info received")
             return
         kpath = kinfo['klipper_path']
-        kversion = kinfo['software_version']
         env = kinfo['python_path']
-        self.updaters['klipper'] = GitUpdater(
-            self, "klipper", kpath, kversion, env)
+        self.updaters['klipper'] = GitUpdater(self, "klipper", kpath, env)
 
-    async def _check_versions(self):
+    async def _refresh_git_repo_state(self):
         for updater in self.updaters.values():
-            await updater.check_remote_version()
+            ret = updater.refresh_update_state()
+            if asyncio.iscoroutine(ret):
+                await ret
 
     async def _handle_update_request(self, web_request):
         app = web_request.get_endpoint().split("/")[-1]
@@ -114,7 +114,7 @@ class UpdateManager:
 
     async def _handle_status_request(self, web_request):
         if web_request.get_boolean('refresh', False):
-            await self._check_versions()
+            await self._refresh_git_repo_state()
         vinfo = {}
         for name, updater in self.updaters.items():
             if hasattr(updater, "get_update_status"):
@@ -165,14 +165,15 @@ class UpdateManager:
             decoded = json.loads(resp.body)
             return decoded
 
-    def notify_update_response(self, resp):
+    def notify_update_response(self, resp, is_complete=False):
         resp = resp.strip()
         if isinstance(resp, bytes):
             resp = resp.decode()
         notification = {
             'message': resp,
             'application': None,
-            'proc_id': None}
+            'proc_id': None,
+            'complete': is_complete}
         if self.current_update is not None:
             notification['application'] = self.current_update[0]
             notification['proc_id'] = self.current_update[1]
@@ -184,7 +185,7 @@ class UpdateManager:
 
 
 class GitUpdater:
-    def __init__(self, umgr, name, path, ver, env):
+    def __init__(self, umgr, name, path, env):
         self.server = umgr.server
         self.execute_cmd = umgr.execute_cmd
         self.execute_cmd_with_response = umgr.execute_cmd_with_response
@@ -194,14 +195,8 @@ class GitUpdater:
         self.repo_path = path
         self.env = env
         self.version = self.cur_hash = self.remote_hash = "?"
-        self.is_valid = False
-        self.is_dirty = ver.endswith("dirty")
-        tag_version = "?"
-        ver_match = re.match(r"v\d+\.\d+\.\d-\d+", ver)
-        if ver_match:
-            tag_version = ver_match.group()
-        self.version = tag_version
-        IOLoop.current().spawn_callback(self._init_repo)
+        self.is_valid = self.is_dirty = False
+        IOLoop.current().spawn_callback(self.refresh_update_state)
 
     def _get_version_info(self):
         ver_path = os.path.join(self.repo_path, "scripts/version.txt")
@@ -234,12 +229,12 @@ class GitUpdater:
         log_msg = f"Repo {self.name}: {msg}"
         logging.info(log_msg)
 
-    def _notify_status(self, msg):
+    def _notify_status(self, msg, is_complete=False):
         log_msg = f"Repo {self.name}: {msg}"
         logging.debug(log_msg)
-        self.notify_update_response(log_msg)
+        self.notify_update_response(log_msg, is_complete)
 
-    async def _init_repo(self):
+    async def refresh_update_state(self):
         self.is_valid = False
         self.cur_hash = "?"
         try:
@@ -249,9 +244,19 @@ class GitUpdater:
                 f"git -C {self.repo_path} remote get-url origin")
             hash = await self.execute_cmd_with_response(
                 f"git -C {self.repo_path} rev-parse HEAD")
+            repo_version = await self.execute_cmd_with_response(
+                f"git -C {self.repo_path} describe --always "
+                "--tags --long --dirty")
         except Exception:
             self._log_exc("Error retreiving git info")
             return
+
+        self.is_dirty = repo_version.endswith("dirty")
+        tag_version = "?"
+        ver_match = re.match(r"v\d+\.\d+\.\d-\d+", repo_version)
+        if ver_match:
+            tag_version = ver_match.group()
+        self.version = tag_version
 
         if not branch.startswith("fatal:"):
             self.cur_hash = hash
@@ -267,7 +272,7 @@ class GitUpdater:
             else:
                 self._log_info("Git repo not on master branch")
         else:
-            self._log_info(f"Invalid git repo at path '{self.repo_path}''")
+            self._log_info(f"Invalid git repo at path '{self.repo_path}'")
         try:
             await self.check_remote_version()
         except Exception:
@@ -314,9 +319,12 @@ class GitUpdater:
         if self.name == "moonraker":
             # Launch restart async so the request can return
             # before the server restarts
-            IOLoop.current().spawn_callback(self.restart_service)
+            self._notify_status("Update Finished...",
+                                is_complete=True)
+            IOLoop.current().call_later(.1, self.restart_service)
         else:
             await self.restart_service()
+            self._notify_status("Update Finished...", is_complete=True)
 
     async def _install_packages(self):
         # Open install file file and read
@@ -400,7 +408,9 @@ class PackageUpdater:
         self.execute_cmd = umgr.execute_cmd
         self.notify_update_response = umgr.notify_update_response
 
-    async def check_remote_version(self):
+    def refresh_update_state(self):
+        # TODO: We should be able to determine if packages need to be
+        # updated here
         pass
 
     async def update(self, *args):
@@ -412,6 +422,8 @@ class PackageUpdater:
                 f"{APT_CMD} upgrade --yes", timeout=3600., notify=True)
         except Exception:
             raise self.server.error("Error updating system packages")
+        self.notify_update_response("Package update finished...",
+                                    is_complete=True)
 
 class ClientUpdater:
     def __init__(self, umgr, repo, path):
@@ -422,17 +434,24 @@ class ClientUpdater:
         self.name = self.repo.split("/")[-1]
         self.path = path
         self.version = self.remote_version = self.dl_url = "?"
+        self._get_local_version()
+        logging.info(f"\nInitializing Client Updater: '{self.name}',"
+                     f"\nversion: {self.version}"
+                     f"\npath: {self.path}")
+        IOLoop.current().spawn_callback(self.refresh_update_state)
+
+    def _get_local_version(self):
         version_path = os.path.join(self.path, ".version")
         if os.path.isfile(os.path.join(self.path, ".version")):
             with open(version_path, "r") as f:
                 v = f.read()
             self.version = v.strip()
-        logging.info(f"\nInitializing repo '{self.name}',"
-                     f"\nversion: {self.version}"
-                     f"\npath: {self.path}")
-        IOLoop.current().spawn_callback(self.check_remote_version)
 
-    async def check_remote_version(self):
+    async def refresh_update_state(self):
+        # Local state
+        self._get_local_version()
+
+        # Remote state
         url = f"https://api.github.com/repos/{self.repo}/releases/latest"
         try:
             result = await self.github_request(url)
@@ -471,7 +490,8 @@ class ClientUpdater:
         if not os.path.exists(version_path):
             with open(version_path, "w") as f:
                 f.write(self.version)
-        self.notify_update_response(f"Client Updated: {self.name}")
+        self.notify_update_response(f"Client Updated Finished: {self.name}",
+                                    is_complete=True)
 
     def get_update_status(self):
         return {
