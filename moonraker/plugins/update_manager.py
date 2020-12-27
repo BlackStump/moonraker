@@ -15,6 +15,7 @@ import asyncio
 import tornado.gen
 from tornado.ioloop import IOLoop
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
+from tornado.locks import Event
 
 MOONRAKER_PATH = os.path.normpath(os.path.join(
     os.path.dirname(__file__), "../.."))
@@ -29,14 +30,20 @@ REPO_DATA = {
         'origin': "https://github.com/arksine/moonraker.git",
         'install_script': "scripts/install-moonraker.sh",
         'requirements': "scripts/moonraker-requirements.txt",
-        'venv_args': "-p python3 --system-site-packages"
+        'venv_args': "-p python3",
+        'dist_packages': ["gpiod"],
+        'dist_dir': "/usr/lib/python3/dist-packages",
+        'site_pkg_path': "lib/python3.7/site-packages",
     },
     'klipper': {
         'repo_url': f"{REPO_PREFIX}/kevinoconnor/klipper/branches/master",
         'origin': "https://github.com/kevinoconnor/klipper.git",
         'install_script': "scripts/install-octopi.sh",
         'requirements': "scripts/klippy-requirements.txt",
-        'venv_args': "-p python2"
+        'venv_args': "-p python2",
+        'dist_packages': [],
+        'dist_dir': "",
+        'site_pkg_path': "",
     }
 }
 
@@ -89,12 +96,6 @@ class UpdateManager:
         env = kinfo['python_path']
         self.updaters['klipper'] = GitUpdater(self, "klipper", kpath, env)
 
-    async def _refresh_git_repo_state(self):
-        for updater in self.updaters.values():
-            ret = updater.refresh_update_state()
-            if asyncio.iscoroutine(ret):
-                await ret
-
     async def _handle_update_request(self, web_request):
         app = web_request.get_endpoint().split("/")[-1]
         inc_deps = web_request.get_boolean('include_deps', False)
@@ -113,10 +114,14 @@ class UpdateManager:
         return "ok"
 
     async def _handle_status_request(self, web_request):
-        if web_request.get_boolean('refresh', False):
-            await self._refresh_git_repo_state()
+        refresh = web_request.get_boolean('refresh', False)
         vinfo = {}
         for name, updater in self.updaters.items():
+            await updater.check_initialized(10.)
+            if refresh:
+                ret = updater.refresh()
+                if asyncio.iscoroutine(ret):
+                    await ret
             if hasattr(updater, "get_update_status"):
                 vinfo[name] = updater.get_update_status()
         return {
@@ -195,8 +200,9 @@ class GitUpdater:
         self.repo_path = path
         self.env = env
         self.version = self.cur_hash = self.remote_hash = "?"
+        self.init_evt = Event()
         self.is_valid = self.is_dirty = False
-        IOLoop.current().spawn_callback(self.refresh_update_state)
+        IOLoop.current().spawn_callback(self.refresh)
 
     def _get_version_info(self):
         ver_path = os.path.join(self.repo_path, "scripts/version.txt")
@@ -234,7 +240,19 @@ class GitUpdater:
         logging.debug(log_msg)
         self.notify_update_response(log_msg, is_complete)
 
-    async def refresh_update_state(self):
+    async def check_initialized(self, timeout=None):
+        if self.init_evt.is_set():
+            return
+        if timeout is not None:
+            to = IOLoop.current().time() + timeout
+        await self.init_evt.wait(to)
+
+    async def refresh(self):
+        await self._check_local_version()
+        await self._check_remote_version()
+        self.init_evt.set()
+
+    async def _check_local_version(self):
         self.is_valid = False
         self.cur_hash = "?"
         try:
@@ -273,12 +291,8 @@ class GitUpdater:
                 self._log_info("Git repo not on master branch")
         else:
             self._log_info(f"Invalid git repo at path '{self.repo_path}'")
-        try:
-            await self.check_remote_version()
-        except Exception:
-            pass
 
-    async def check_remote_version(self):
+    async def _check_remote_version(self):
         repo_url = REPO_DATA[self.name]['repo_url']
         try:
             branch_info = await self.github_request(repo_url)
@@ -299,7 +313,7 @@ class GitUpdater:
             raise self._log_exc(
                 "Update aborted, repo is has been modified", False)
         if self.remote_hash == "?":
-            await self.check_remote_version()
+            await self._check_remote_version()
         if self.remote_hash == self.cur_hash:
             # No need to update
             return
@@ -316,6 +330,10 @@ class GitUpdater:
         if update_deps:
             await self._install_packages()
             await self._update_virtualenv(need_env_rebuild)
+        elif need_env_rebuild:
+            await self._update_virtualenv(True)
+        # Refresh local repo state
+        await self._check_local_version()
         if self.name == "moonraker":
             # Launch restart async so the request can return
             # before the server restarts
@@ -372,6 +390,17 @@ class GitUpdater:
                 return
             if not os.path.expanduser(self.env):
                 raise self._log_exc("Failed to create new virtualenv", False)
+            dist_pkgs = REPO_DATA[self.name]['dist_packages']
+            dist_dir = REPO_DATA[self.name]['dist_dir']
+            site_path = REPO_DATA[self.name]['site_pkg_path']
+            for pkg in dist_pkgs:
+                for f in os.listdir(dist_dir):
+                    if f.startswith(pkg):
+                        src = os.path.join(dist_dir, f)
+                        dest = os.path.join(env_path, site_path, f)
+                        self._notify_status(f"Linking to dist package: {pkg}")
+                        os.symlink(src, dest)
+                        break
         reqs = os.path.join(
             self.repo_path, REPO_DATA[self.name]['requirements'])
         if not os.path.isfile(reqs):
@@ -408,9 +437,12 @@ class PackageUpdater:
         self.execute_cmd = umgr.execute_cmd
         self.notify_update_response = umgr.notify_update_response
 
-    def refresh_update_state(self):
+    def refresh(self):
         # TODO: We should be able to determine if packages need to be
         # updated here
+        pass
+
+    async def check_initialized(self, timeout=None):
         pass
 
     async def update(self, *args):
@@ -434,11 +466,12 @@ class ClientUpdater:
         self.name = self.repo.split("/")[-1]
         self.path = path
         self.version = self.remote_version = self.dl_url = "?"
+        self.init_evt = Event()
         self._get_local_version()
         logging.info(f"\nInitializing Client Updater: '{self.name}',"
                      f"\nversion: {self.version}"
                      f"\npath: {self.path}")
-        IOLoop.current().spawn_callback(self.refresh_update_state)
+        IOLoop.current().spawn_callback(self.refresh)
 
     def _get_local_version(self):
         version_path = os.path.join(self.path, ".version")
@@ -447,7 +480,14 @@ class ClientUpdater:
                 v = f.read()
             self.version = v.strip()
 
-    async def refresh_update_state(self):
+    async def check_initialized(self, timeout=None):
+        if self.init_evt.is_set():
+            return
+        if timeout is not None:
+            to = IOLoop.current().time() + timeout
+        await self.init_evt.wait(to)
+
+    async def refresh(self):
         # Local state
         self._get_local_version()
 
@@ -465,10 +505,11 @@ class ClientUpdater:
             f"Github client Info Received: {self.name}, "
             f"version: {self.remote_version} "
             f"url: {self.dl_url}")
+        self.init_evt.set()
 
     async def update(self, *args):
         if self.remote_version == "?":
-            await self.check_remote_version()
+            await self.refresh()
             if self.remote_version == "?":
                 raise self.server.error(
                     f"Client {self.repo}: Unable to locate update")
