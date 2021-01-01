@@ -44,13 +44,9 @@ config_path:
 #   The path to a directory where configuration files are located. This
 #   directory may contain Klipper config files (printer.cfg) or Moonraker
 #   config files (moonraker.conf).  Clients may also write their own config
-#   files to this directory.  There are restrictions on the location of
-#   this path, it must be located within the users HOME directory or within
-#   "/etc/moonraker".  The path may not be the HOME directory itself.  It is
-#   valid for the path to be "/etc/moonraker", however this is not recommended.
-#   Something like "/etc/moonraker/config" would be a more appropriate option.
-#   If you choose to locate files in "/etc/moonraker" be sure that Moonraker
-#   has read/write permissions in this directory.
+#   files to this directory.  Note that this may not be the system root
+#   (ie: "/") and moonraker must have read and write access permissions
+#   for this directory.
 ```
 ## authorization
 
@@ -252,6 +248,16 @@ disk or cloned from unofficial sources are not supported.
 # moonraker.conf
 
 [update_manager]
+enable_repo_debug: False
+#   When set to True moonraker will bypass repo validation and allow
+#   updates from unofficial remotes and/or branches.  Updates on
+#   detached repos are also allowed.  This option is intended for
+#   developers and should not be used on production machines.  The
+#   default is False.
+distro: debian
+#   The disto in which moonraker has been installed.  Currently the
+#   update manager only supports "debian", which encompasses all of
+#   its derivatives.  The default is debain.
 client_repo:
 #   This is the GitHub repo of the client, in the format of user/client.
 #   For example, this could be set to cadriel/fluidd to update Fluidd or
