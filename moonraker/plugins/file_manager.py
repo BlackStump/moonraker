@@ -77,8 +77,10 @@ class FileManager:
 
         # Register log path
         log_file = paths.get('log_file')
-        log_path = os.path.normpath(os.path.expanduser(log_file))
-        self.server.register_static_file_handler("klippy.log", log_path)
+        if log_file is not None:
+            log_path = os.path.normpath(os.path.expanduser(log_file))
+            self.server.register_static_file_handler(
+                "klippy.log", log_path, force=True)
 
     def register_directory(self, root, path):
         if path is None:
@@ -285,6 +287,8 @@ class FileManager:
             elif os.path.isfile(full_path):
                 path_info['filename'] = fname
                 flist['files'].append(path_info)
+        usage = shutil.disk_usage(path)
+        flist['disk_usage'] = usage._asdict()
         return flist
 
     def _get_path_info(self, path):
@@ -680,7 +684,7 @@ class MetadataStorage:
         scmd = shell_command.build_shell_command(
             cmd, self._handle_script_response)
         self.script_response = None
-        await scmd.run(timeout=4.)
+        await scmd.run(timeout=10.)
         if self.script_response is None:
             raise self.server.error("Unable to extract metadata")
         path = self.script_response['file']

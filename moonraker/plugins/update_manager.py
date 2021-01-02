@@ -16,7 +16,7 @@ import time
 import tornado.gen
 from tornado.ioloop import IOLoop
 from tornado.httpclient import AsyncHTTPClient
-from tornado.locks import Event
+from tornado.locks import Event, Condition, Lock
 
 MOONRAKER_PATH = os.path.normpath(os.path.join(
     os.path.dirname(__file__), "../.."))
@@ -58,6 +58,8 @@ class UpdateManager:
         self.gh_limit_remaining = None
         self.gh_limit_reset_time = None
         self.gh_init_evt = Event()
+        self.cmd_request_lock = Lock()
+        self.is_refreshing = False
 
         self.server.register_endpoint(
             "/machine/update/moonraker", ["POST"],
@@ -98,31 +100,50 @@ class UpdateManager:
     async def _handle_update_request(self, web_request):
         app = web_request.get_endpoint().split("/")[-1]
         inc_deps = web_request.get_boolean('include_deps', False)
-        if self.current_update:
-            raise self.server.error("A current update is in progress")
+        if self.current_update is not None and \
+                self.current_update[0] == app:
+            return f"Object {app} is currently being updated"
         updater = self.updaters.get(app, None)
         if updater is None:
             raise self.server.error(f"Updater {app} not available")
-        self.current_update = (app, id(web_request))
-        try:
-            await updater.update(inc_deps)
-        except Exception:
-            self.current_update = None
-            raise
-        self.current_update = None
+        async with self.cmd_request_lock:
+            self.current_update = (app, id(web_request))
+            try:
+                await updater.update(inc_deps)
+            except Exception:
+                raise
+            finally:
+                self.current_update = None
         return "ok"
 
     async def _handle_status_request(self, web_request):
-        refresh = web_request.get_boolean('refresh', False)
+        check_refresh = web_request.get_boolean('refresh', False)
+        # Don't refresh if an update is currently in progress,
+        # just return current state
+        check_refresh &= self.current_update is None
+        need_refresh = False
+        if check_refresh:
+            # If there is an outstanding request processing a
+            # refresh, we don't need to do it again.
+            need_refresh = not self.is_refreshing
+            await self.cmd_request_lock.acquire()
+            self.is_refreshing = True
         vinfo = {}
-        for name, updater in self.updaters.items():
-            await updater.check_initialized(120.)
-            if refresh:
-                ret = updater.refresh()
-                if asyncio.iscoroutine(ret):
-                    await ret
-            if hasattr(updater, "get_update_status"):
-                vinfo[name] = updater.get_update_status()
+        try:
+            for name, updater in list(self.updaters.items()):
+                await updater.check_initialized(120.)
+                if need_refresh:
+                    ret = updater.refresh()
+                    if asyncio.iscoroutine(ret):
+                        await ret
+                if hasattr(updater, "get_update_status"):
+                    vinfo[name] = updater.get_update_status()
+        except Exception:
+            raise
+        finally:
+            if check_refresh:
+                self.is_refreshing = False
+                self.cmd_request_lock.release()
         return {
             'version_info': vinfo,
             'github_rate_limit': self.gh_rate_limit,
@@ -144,7 +165,10 @@ class UpdateManager:
     async def execute_cmd_with_response(self, cmd, timeout=10.):
         shell_command = self.server.lookup_plugin('shell_command')
         scmd = shell_command.build_shell_command(cmd, None)
-        return await scmd.run_with_response(timeout)
+        result = await scmd.run_with_response(timeout, retries=5)
+        if result is None:
+            raise self.server.error(f"Error Running Command: {cmd}")
+        return result
 
     async def _init_api_rate_limit(self):
         url = "https://api.github.com/rate_limit"
@@ -288,6 +312,7 @@ class GitUpdater:
         self.version = self.cur_hash = "?"
         self.remote_version = self.remote_hash = "?"
         self.init_evt = Event()
+        self.refresh_condition = None
         self.debug = umgr.repo_debug
         self.remote = "origin"
         self.branch = "master"
@@ -338,8 +363,19 @@ class GitUpdater:
         await self.init_evt.wait(timeout)
 
     async def refresh(self):
-        await self._check_version()
-        self.init_evt.set()
+        if self.refresh_condition is None:
+            self.refresh_condition = Condition()
+        else:
+            self.refresh_condition.wait()
+            return
+        try:
+            await self._check_version()
+        except Exception:
+            logging.exception("Error Refreshing git state")
+        else:
+            self.init_evt.set()
+        self.refresh_condition.notify_all()
+        self.refresh_condition = None
 
     async def _check_version(self, need_fetch=True):
         self.is_valid = self.detached = False
@@ -431,6 +467,9 @@ class GitUpdater:
                 f"{self.remote}/{self.branch}")
 
     async def update(self, update_deps=False):
+        await self.check_initialized(20.)
+        if self.refresh_condition is not None:
+            self.refresh_condition.wait()
         if not self.is_valid:
             raise self._log_exc("Update aborted, repo is not valid", False)
         if self.is_dirty:
@@ -589,17 +628,20 @@ class PackageUpdater:
         self.notify_update_response = umgr.notify_update_response
         self.available_packages = []
         self.init_evt = Event()
+        self.refresh_condition = None
         IOLoop.current().spawn_callback(self.refresh)
 
     async def refresh(self):
         # TODO: Use python-apt python lib rather than command line for updates
+        if self.refresh_condition is None:
+            self.refresh_condition = Condition()
+        else:
+            self.refresh_condition.wait()
+            return
         try:
             await self.execute_cmd(f"{APT_CMD} update", timeout=300.)
             res = await self.execute_cmd_with_response(
                 "apt list --upgradable")
-        except Exception:
-            logging.exception("Error Refreshing System Packages")
-        else:
             pkg_list = [p.strip() for p in res.split("\n") if p.strip()]
             if pkg_list:
                 pkg_list = pkg_list[2:]
@@ -609,7 +651,12 @@ class PackageUpdater:
             logging.info(
                 f"Detected {len(self.available_packages)} package updates:"
                 f"\n{pkg_list}")
-        self.init_evt.set()
+        except Exception:
+            logging.exception("Error Refreshing System Packages")
+        else:
+            self.init_evt.set()
+        self.refresh_condition.notify_all()
+        self.refresh_condition = None
 
     async def check_initialized(self, timeout=None):
         if self.init_evt.is_set():
@@ -619,6 +666,9 @@ class PackageUpdater:
         await self.init_evt.wait(timeout)
 
     async def update(self, *args):
+        await self.check_initialized(20.)
+        if self.refresh_condition is not None:
+            self.refresh_condition.wait()
         self.notify_update_response("Updating packages...")
         try:
             await self.execute_cmd(
@@ -648,6 +698,7 @@ class ClientUpdater:
         self.version = self.remote_version = self.dl_url = "?"
         self.etag = None
         self.init_evt = Event()
+        self.refresh_condition = None
         self._get_local_version()
         logging.info(f"\nInitializing Client Updater: '{self.name}',"
                      f"\nversion: {self.version}"
@@ -669,9 +720,22 @@ class ClientUpdater:
         await self.init_evt.wait(timeout)
 
     async def refresh(self):
-        # Local state
-        self._get_local_version()
+        if self.refresh_condition is None:
+            self.refresh_condition = Condition()
+        else:
+            self.refresh_condition.wait()
+            return
+        try:
+            self._get_local_version()
+            await self._get_remote_version()
+        except Exception:
+            logging.exception("Error Refreshing Client")
+        else:
+            self.init_evt.set()
+        self.refresh_condition.notify_all()
+        self.refresh_condition = None
 
+    async def _get_remote_version(self):
         # Remote state
         url = f"https://api.github.com/repos/{self.repo}/releases/latest"
         try:
@@ -681,7 +745,7 @@ class ClientUpdater:
             result = {}
         if result is None:
             # No change, update not necessary
-            return None
+            return
         self.etag = result.get('etag', None)
         self.remote_version = result.get('name', "?")
         release_assets = result.get('assets', [{}])[0]
@@ -691,9 +755,12 @@ class ClientUpdater:
             f"Local Version: {self.version}\n"
             f"Remote Version: {self.remote_version}\n"
             f"url: {self.dl_url}")
-        self.init_evt.set()
 
     async def update(self, *args):
+        await self.check_initialized(20.)
+        if self.refresh_condition is not None:
+            # wait for refresh if in progess
+            self.refresh_condition.wait()
         if self.remote_version == "?":
             await self.refresh()
             if self.remote_version == "?":
