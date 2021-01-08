@@ -14,7 +14,7 @@ import io
 import asyncio
 import time
 import tornado.gen
-from tornado.ioloop import IOLoop
+from tornado.ioloop import IOLoop, PeriodicCallback
 from tornado.httpclient import AsyncHTTPClient
 from tornado.locks import Event, Condition, Lock
 
@@ -25,13 +25,18 @@ SUPPLEMENTAL_CFG_PATH = os.path.join(
 APT_CMD = "sudo DEBIAN_FRONTEND=noninteractive apt-get"
 SUPPORTED_DISTROS = ["debian"]
 
+# Check For Updates Every 2 Hours
+UPDATE_REFRESH_TIME = 7200000
+# Refresh APT Repo no sooner than 12 hours
+MIN_PKG_UPDATE_INTERVAL = 43200
+# Refresh APT Repo no later than 5am
+MAX_PKG_UPDATE_HOUR = 5
+
 class UpdateManager:
     def __init__(self, config):
         self.server = config.get_server()
         self.config = config
         self.config.read_supplemental_config(SUPPLEMENTAL_CFG_PATH)
-        AsyncHTTPClient.configure(None, defaults=dict(user_agent="Moonraker"))
-        self.http_client = AsyncHTTPClient()
         self.repo_debug = config.getboolean('enable_repo_debug', False)
         self.distro = config.get('distro', "debian").lower()
         if self.distro not in SUPPORTED_DISTROS:
@@ -61,6 +66,15 @@ class UpdateManager:
         self.cmd_request_lock = Lock()
         self.is_refreshing = False
 
+        # Auto Status Refresh
+        self.last_package_refresh_time = 0
+        self.refresh_cb = PeriodicCallback(
+            self._handle_auto_refresh, UPDATE_REFRESH_TIME)
+        self.refresh_cb.start()
+
+        AsyncHTTPClient.configure(None, defaults=dict(user_agent="Moonraker"))
+        self.http_client = AsyncHTTPClient()
+
         self.server.register_endpoint(
             "/machine/update/moonraker", ["POST"],
             self._handle_update_request)
@@ -80,8 +94,16 @@ class UpdateManager:
         # Register Ready Event
         self.server.register_event_handler(
             "server:klippy_identified", self._set_klipper_repo)
-        # Initialize GitHub API Rate Limits
-        IOLoop.current().spawn_callback(self._init_api_rate_limit)
+        # Initialize GitHub API Rate Limits and configured updaters
+        IOLoop.current().spawn_callback(
+            self._initalize_updaters, list(self.updaters.values()))
+
+    async def _initalize_updaters(self, initial_updaters):
+        await self._init_api_rate_limit()
+        for updater in initial_updaters:
+            ret = updater.refresh()
+            if asyncio.iscoroutine(ret):
+                await updater.refresh()
 
     async def _set_klipper_repo(self):
         kinfo = self.server.get_klippy_info()
@@ -96,8 +118,62 @@ class UpdateManager:
             # Current Klipper Updater is valid
             return
         self.updaters['klipper'] = GitUpdater(self, "klipper", kpath, env)
+        await self.updaters['klipper'].refresh()
+
+    async def _check_klippy_printing(self):
+        klippy_apis = self.server.lookup_plugin('klippy_apis')
+        result = await klippy_apis.query_objects(
+            {'print_stats': None}, default={})
+        pstate = result.get('print_stats', {}).get('state', "")
+        return pstate.lower() == "printing"
+
+    async def _handle_auto_refresh(self):
+        if await self._check_klippy_printing():
+            # Don't Refresh during a print
+            logging.info("Klippy is printing, auto refresh aborted")
+            return
+        vinfo = {}
+        need_refresh_all = not self.is_refreshing
+        async with self.cmd_request_lock:
+            self.is_refreshing = True
+            cur_time = time.time()
+            cur_hour = time.localtime(cur_time).tm_hour
+            time_diff = cur_time - self.last_package_refresh_time
+            try:
+                # Update packages if it has been more than 12 hours
+                # and the local time is between 12AM and 5AM
+                if time_diff > MIN_PKG_UPDATE_INTERVAL and \
+                        cur_hour <= MAX_PKG_UPDATE_HOUR:
+                    self.last_package_refresh_time = cur_time
+                    sys_updater = self.updaters['system']
+                    await sys_updater.refresh(True)
+                    vinfo['system'] = sys_updater.get_update_status()
+                for name, updater in list(self.updaters.items()):
+                    if name in vinfo:
+                        # System was refreshed and added to version info
+                        continue
+                    if need_refresh_all:
+                        ret = updater.refresh()
+                        if asyncio.iscoroutine(ret):
+                            await ret
+                    if hasattr(updater, "get_update_status"):
+                        vinfo[name] = updater.get_update_status()
+            except Exception:
+                logging.exception("Unable to Refresh Status")
+                return
+            finally:
+                self.is_refreshing = False
+        uinfo = {
+            'version_info': vinfo,
+            'github_rate_limit': self.gh_rate_limit,
+            'github_requests_remaining': self.gh_limit_remaining,
+            'github_limit_reset_time': self.gh_limit_reset_time,
+            'busy': self.current_update is not None}
+        self.server.send_event("update_manager:update_refreshed", uinfo)
 
     async def _handle_update_request(self, web_request):
+        if await self._check_klippy_printing():
+            raise self.server.error("Update Refused: Klippy is printing")
         app = web_request.get_endpoint().split("/")[-1]
         inc_deps = web_request.get_boolean('include_deps', False)
         if self.current_update is not None and \
@@ -110,7 +186,9 @@ class UpdateManager:
             self.current_update = (app, id(web_request))
             try:
                 await updater.update(inc_deps)
-            except Exception:
+            except Exception as e:
+                self.notify_update_response(f"Error updating {app}")
+                self.notify_update_response(str(e), is_complete=True)
                 raise
             finally:
                 self.current_update = None
@@ -118,9 +196,12 @@ class UpdateManager:
 
     async def _handle_status_request(self, web_request):
         check_refresh = web_request.get_boolean('refresh', False)
-        # Don't refresh if an update is currently in progress,
-        # just return current state
-        check_refresh &= self.current_update is None
+        # Don't refresh if a print is currently in progress or
+        # if an update is in progress.  Just return the current
+        # state
+        if self.current_update is not None or \
+                await self._check_klippy_printing():
+            check_refresh = False
         need_refresh = False
         if check_refresh:
             # If there is an outstanding request processing a
@@ -214,9 +295,11 @@ class UpdateManager:
         retries = 5
         while retries:
             try:
-                resp = await self.http_client.fetch(
+                timeout = time.time() + 10.
+                fut = self.http_client.fetch(
                     url, headers=headers, connect_timeout=5.,
                     request_timeout=5., raise_error=False)
+                resp = await tornado.gen.with_timeout(timeout, fut)
             except Exception:
                 retries -= 1
                 msg = f"Error Processing GitHub API request: {url}"
@@ -265,9 +348,11 @@ class UpdateManager:
         retries = 5
         while retries:
             try:
-                resp = await self.http_client.fetch(
+                timeout = time.time() + 130.
+                fut = self.http_client.fetch(
                     url, headers={"Accept": "application/zip"},
                     connect_timeout=5., request_timeout=120.)
+                resp = await tornado.gen.with_timeout(timeout, fut)
             except Exception:
                 retries -= 1
                 logging.exception("Error Processing Download")
@@ -294,6 +379,7 @@ class UpdateManager:
 
     def close(self):
         self.http_client.close()
+        self.refresh_cb.stop()
 
 
 class GitUpdater:
@@ -317,7 +403,6 @@ class GitUpdater:
         self.remote = "origin"
         self.branch = "master"
         self.is_valid = self.is_dirty = self.detached = False
-        IOLoop.current().spawn_callback(self.refresh)
 
     def _get_version_info(self):
         ver_path = os.path.join(self.repo_path, "scripts/version.txt")
@@ -629,9 +714,8 @@ class PackageUpdater:
         self.available_packages = []
         self.init_evt = Event()
         self.refresh_condition = None
-        IOLoop.current().spawn_callback(self.refresh)
 
-    async def refresh(self):
+    async def refresh(self, fetch_packages=False):
         # TODO: Use python-apt python lib rather than command line for updates
         if self.refresh_condition is None:
             self.refresh_condition = Condition()
@@ -639,7 +723,8 @@ class PackageUpdater:
             self.refresh_condition.wait()
             return
         try:
-            await self.execute_cmd(f"{APT_CMD} update", timeout=300.)
+            if fetch_packages:
+                await self.execute_cmd(f"{APT_CMD} update", timeout=300.)
             res = await self.execute_cmd_with_response(
                 "apt list --upgradable")
             pkg_list = [p.strip() for p in res.split("\n") if p.strip()]
@@ -703,7 +788,6 @@ class ClientUpdater:
         logging.info(f"\nInitializing Client Updater: '{self.name}',"
                      f"\nversion: {self.version}"
                      f"\npath: {self.path}")
-        IOLoop.current().spawn_callback(self.refresh)
 
     def _get_local_version(self):
         version_path = os.path.join(self.path, ".version")
