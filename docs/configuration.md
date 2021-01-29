@@ -151,6 +151,17 @@ off_when_shutdown: False
 #   If set to True the device will be powered off when Klipper enters
 #   the "shutdown" state.  This option applies to all device types.
 #   The default is False.
+locked_while_printing: False
+#   If True, locks the device so that the power cannot be changed while the
+#   printer is printing. This is useful to avert an accidental shutdown to
+#   the printer's power.  The default is False.
+restart_klipper_when_powered: False
+#   If set to True, Moonraker will issue a "FIRMWARE_RESTART" to Klipper
+#   after the device has been powered on.  The default is False, thus no
+#   attempt to made to restart Klipper after power on.
+restart_delay: 1.
+#   If "restart_klipper_when_powered" is set, this option specifies the amount
+#   of time (in seconds) to delay the restart.  Default is 1 second.
 pin: gpiochip0/gpio26
 #   The pin to use for GPIO devices.  The chip is optional, if left out
 #   then the module will default to gpiochip0.  If one wishes to invert
@@ -164,10 +175,6 @@ initial_state: off
 #    The initial state for GPIO type devices.  May be on or
 #    off.  When moonraker starts the device will be set to this
 #    state.  Default is off.
-locked_while_printing: False
-#   If True, locks the device so that the power cannot be changed while the
-#   printer is printing. This is useful to avert an accidental shutdown to
-#   the printer's power.
 address:
 port:
 #   The above options are used for "tplink_smartplug" devices.  The
@@ -262,6 +269,12 @@ enable_repo_debug: False
 #   updates from unofficial remotes and/or branches.  Updates on
 #   detached repos are also allowed.  This option is intended for
 #   developers and should not be used on production machines.  The
+#   default is False.
+enable_auto_refresh: False
+#   When set to True Moonraker will attempt to fetch status about
+#   available updates roughly every 24 hours, between 12am-4am.
+#   When set to False Moonraker will only fetch update state on startup
+#   and clients will need to request that Moonraker updates state.  The
 #   default is False.
 distro: debian
 #   The disto in which moonraker has been installed.  Currently the
