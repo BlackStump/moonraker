@@ -47,6 +47,13 @@ config_path:
 #   files to this directory.  Note that this may not be the system root
 #   (ie: "/") and moonraker must have read and write access permissions
 #   for this directory.
+temperature_store_size: 1200
+#   The maximum number of temperature values to store for each sensor. Note
+#   that this value also applies to the "target", "power", and "fan_speed"
+#   if the sensor reports them.  The default is 1200, which is enough to
+#   store approximately 20 minutes of data at one value per second.
+gcode_store_size:  1000
+#   The maximum number "gcode lines" to store.  The default is 1000.
 ```
 ## authorization
 
@@ -192,6 +199,17 @@ output_id:
 #   If your single-relay Tasmota device switches on/off successfully,
 #   but fails to report its state, ensure that 'SetOption26' is set in
 #   Tasmota.
+address:
+user:
+password:
+output_id:
+#   The above options are used for "shelly" devices.  The
+#   address should be a valid ip or hostname for the Shelly device.
+#   Provide a user and password if configured in Shelly (default is empty).
+#   If password is set but user is empty the default user "admin" will be used
+#   Provided an output_id (relay id) if the Shelly device supports
+#   more than one (default is 0).
+
 
 ```
 Below are some potential examples:
@@ -222,6 +240,12 @@ address: 192.168.1.123
 type: tasmota
 address: 192.168.1.124
 password: password1
+
+[power shelly_plug]
+type: shelly
+address: 192.168.1.125
+user: user2
+password: password2
 ```
 
 It is possible to toggle device power from the Klippy host, this can be done
